@@ -484,8 +484,8 @@ function buildHexes(city){
 function addHexLayers(){
   if(!map.getSource('hexes')){
     map.addSource('hexes',{type:'geojson',data:{type:'FeatureCollection',features:[]}});
-    map.addLayer({id:'hexfill',type:'fill',source:'hexes',paint:{'fill-color':['interpolate',['linear'],['get','count'],0,'rgba(0,0,0,0)',1,'#3d6a8a',6,'#7fb069',14,'#e8c547'],'fill-opacity':0.55}});
-    map.addLayer({id:'hexline',type:'line',source:'hexes',paint:{'line-color':'rgba(233,230,220,0.16)','line-width':1}});
+    map.addLayer({id:'hexfill',type:'fill',source:'hexes',paint:{'fill-color':['interpolate',['linear'],['get','count'],0,'rgba(110,130,150,0.07)',1,'#3d6a8a',6,'#7fb069',14,'#e8c547'],'fill-opacity':0.6}});
+    map.addLayer({id:'hexline',type:'line',source:'hexes',paint:{'line-color':'rgba(233,230,220,0.30)','line-width':1}});
     map.addLayer({id:'hexsel',type:'line',source:'hexes',filter:['==',['get','id'],-1],paint:{'line-color':'#ffffff','line-width':2}});
   }
 }
@@ -494,12 +494,16 @@ async function drawHexes(){
   const catId=S.lens==='overview'?'food':S.lens;
   const cat=CATS.find(c=>c.id===catId);if(!cat)return;
   S.hexCat=catId;
+  // the field itself renders at once; counts land when the geometry arrives
+  const grid=buildHexes(city);S.hexData=grid;
+  const src0=map.getSource('hexes');if(src0)src0.setData(grid);
+  const leg=$('leg-label');if(leg)leg.textContent=cat.name.toUpperCase()+' PER HEX';
   if(!city.geom[catId]){
     try{city.geom[catId]=await fetchGeom(city,cat)}catch(e){city.geom[catId]=[];toast('Hex data unavailable for '+cat.name)}
   }
-  if(S.current!==city)return;
+  if(S.current!==city||S.hexCat!==catId)return;
   const pts=city.geom[catId]||[];
-  const grid=buildHexes(city);const feats=grid.features;
+  const feats=grid.features;
   const mLat=111320;
   pts.forEach(p=>{
     let best=null,bd=1e18;
@@ -509,9 +513,7 @@ async function drawHexes(){
     });
     if(best&&bd<(grid.R*1.1)*(grid.R*1.1)){best.properties.count++;(best._pts=best._pts||[]).push(p)}
   });
-  S.hexData=grid;
   const src=map.getSource('hexes');if(src)src.setData(grid);
-  const leg=$('leg-label');if(leg)leg.textContent=cat.name.toUpperCase()+' PER HEX';
 }
 /* ================= ASSEMBLY 4 + 3: DOSSIER AND DRILL STACK ================= */
 const HOURS=173.33;
@@ -607,6 +609,7 @@ async function selectCity(city,opts){
   await loadCityData(city);
   if(S.current!==city)return;
   renderDossier(city);drawHexes();
+  toast(city.name+' ready',1400);
 }
 function goNation(){
   S.drill=0;S.current=null;S.selHex=null;$('hexpanel').style.display='none';
@@ -663,7 +666,7 @@ async function loadBLS(){
     const parts=await Promise.all(series.map(async ([id,label])=>{
       const d=await fetchJSON('https://api.bls.gov/publicAPI/v2/timeseries/data/'+id,15000);
       const arr=d.Results.series[0].data;const cur=arr[0];
-      const prev=arr.find(x=>x.period===cur.period&&String(Number(cur.year)-1)===x.year);
+      const prev=arr.find(x=>x.period===cur.period&&String(Number(cur.year)-1)===x.year&&!isNaN(Number(x.value)));
       const yoy=prev?(((Number(cur.value)-Number(prev.value))/Number(prev.value))*100):null;
       return label+' <b>'+fmt1(Number(cur.value))+'</b>'+(yoy!=null?' ('+(yoy>=0?'+':'')+fmt1(yoy)+'% yr/yr, '+cur.periodName+' '+cur.year+')':' ('+cur.periodName+' '+cur.year+')');
     }));
@@ -740,12 +743,15 @@ document.addEventListener('keydown',e=>{
     computeRaw(c);
   }));
   renderNation();
-  // slow pass: OSM counts, one city at a time, pins fill in as scores land
-  for(const p of PRESETS){
-    const c=cities.get(keyOf(p));
-    try{c.counts=await fetchCounts(c)}catch(e){}
-    computeRaw(c);scoreCity(c);updatePin(c);if(S.drill===0)renderNation();
-  }
+  // slow pass: OSM counts, three cities at a time, pins fill in as scores land
+  const queue=PRESETS.slice();
+  await Promise.all([0,1,2].map(async()=>{
+    while(queue.length){
+      const p=queue.shift();const c=cities.get(keyOf(p));
+      try{c.counts=await fetchCounts(c)}catch(e){}
+      computeRaw(c);scoreCity(c);updatePin(c);if(S.drill===0)renderNation();
+    }
+  }));
   buildRanges();renderNation();
   const home=cities.get(keyOf(PRESETS[0]));
   if(home)selectCity(home,{fly:true});
