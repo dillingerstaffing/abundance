@@ -330,10 +330,16 @@ function ohsomeURL(city,cat,geom){
 }
 async function fetchCounts(city){
   const out={};
-  await Promise.all(CATS.map(async cat=>{
-    try{const d=await fetchJSON(ohsomeURL(city,cat,false),30000);out[cat.id]=d.result[0].value}
-    catch(e){out[cat.id]=null}
-  }));
+  const one=async cat=>{
+    const d=await fetchJSON(ohsomeURL(city,cat,false),30000);out[cat.id]=d.result[0].value;
+  };
+  await Promise.all(CATS.map(async cat=>{try{await one(cat)}catch(e){out[cat.id]=null}}));
+  // one delayed retry for whatever failed, so a throttled burst does not strand a category
+  const missing=CATS.filter(c=>out[c.id]==null);
+  if(missing.length){
+    await new Promise(r=>setTimeout(r,2500));
+    await Promise.all(missing.map(async cat=>{try{await one(cat)}catch(e){}}));
+  }
   return out;
 }
 const OVERPASS_Q={
@@ -426,7 +432,8 @@ function scoreCity(city){
   s.air=(aqiScore!=null&&parkScore!=null)?Math.round(aqiScore*0.65+parkScore*0.35):(aqiScore!=null?aqiScore:parkScore);
   city.scores=s;
   const vs=Object.values(s).filter(v=>v!=null);
-  city.composite=vs.length?Math.round(vs.reduce((a,b)=>a+b,0)/vs.length):null;
+  // composite only when every category is in; a partial mean reads as a final score and is not
+  city.composite=vs.length===6?Math.round(vs.reduce((a,b)=>a+b,0)/vs.length):null;
 }
 /* ================= ASSEMBLY 1: WORLD SHELL ================= */
 const STYLES={dark:'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',light:'https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json'};
@@ -593,7 +600,7 @@ async function loadCityData(city){
   if(city.geoid&&!city.acs)jobs.push(fetchACS(city).then(a=>{city.acs=a}).catch(()=>{city.acs=null}));
   if(!city.wx||Date.now()-(city._wxT||0)>600000)jobs.push(fetchWX(city).then(w=>{city.wx=w;city._wxT=Date.now()}).catch(()=>{}));
   if(!city.aq||Date.now()-(city._aqT||0)>600000)jobs.push(fetchAQ(city).then(a=>{city.aq=a;city._aqT=Date.now()}).catch(()=>{}));
-  if(!Object.keys(city.counts).length)jobs.push(fetchCounts(city).then(cn=>{city.counts=cn}).catch(()=>{}));
+  if(CATS.some(c=>city.counts[c.id]==null))jobs.push(fetchCounts(city).then(cn=>{city.counts=cn}).catch(()=>{}));
   await Promise.allSettled(jobs);
   computeRaw(city);scoreCity(city);updatePin(city);
 }
@@ -745,7 +752,7 @@ document.addEventListener('keydown',e=>{
   renderNation();
   // slow pass: OSM counts, three cities at a time, pins fill in as scores land
   const queue=PRESETS.slice();
-  await Promise.all([0,1,2].map(async()=>{
+  await Promise.all([0,1].map(async()=>{
     while(queue.length){
       const p=queue.shift();const c=cities.get(keyOf(p));
       try{c.counts=await fetchCounts(c)}catch(e){}
