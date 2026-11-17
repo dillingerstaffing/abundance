@@ -27,11 +27,11 @@ html,body{height:100%;overflow:hidden;background:var(--bg)}
 html{overflow-x:clip}
 body{font-family:var(--sans);color:var(--ink);font-size:14px;-webkit-text-size-adjust:100%;position:relative;height:100vh;height:100dvh}
 #map{position:absolute;inset:0}
-#minimap{position:absolute;right:12px;bottom:44px;width:168px;height:110px;border:1px solid var(--line2);border-radius:3px;overflow:hidden;z-index:5;background:#000}
+#minimap{position:absolute;right:372px;bottom:44px;width:168px;height:110px;border:1px solid var(--line2);border-radius:3px;overflow:hidden;z-index:5;background:#000}
 #minimap .maplibregl-ctrl-attrib{display:none}
 .maplibregl-ctrl-attrib{background:rgba(10,12,14,.72)!important;color:#7c858e!important;font-size:9px!important}
 .maplibregl-ctrl-attrib a{color:#9aa3ab!important}
-.maplibregl-ctrl-top-right{top:72px;right:12px}
+.maplibregl-ctrl-top-right{top:72px;right:372px}
 .maplibregl-ctrl-group{background:var(--panel2)!important;border:1px solid var(--line2);border-radius:3px!important;box-shadow:none!important}
 .maplibregl-ctrl-group button{background:transparent!important}
 .maplibregl-ctrl-group button span{filter:invert(.85)}
@@ -721,7 +721,7 @@ function renderDossier(city){
   const rows=$('catrows');rows.innerHTML='';
   if((S.fieldN||0)<8&&(city.acs||CATS.some(c=>city.counts&&city.counts[c.id]!=null))){
     const note=document.createElement('div');note.className='catrow';
-    note.innerHTML='<div class="vals">Measured values are shown below. Scores appear once at least 8 of the 15 reference cities have reported in every category, so a rank is never computed against a near-empty field.</div>';
+    note.innerHTML='<div class="vals">Measured values are shown below. Scores appear once at least 8 of the 15 reference cities have reported in every category ('+(S.fieldN||0)+' so far), so a rank is never computed against a near-empty field.</div>';
     rows.appendChild(note);
   }
   CATS.forEach(cat=>{
