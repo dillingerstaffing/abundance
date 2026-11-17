@@ -392,6 +392,22 @@ const OVERPASS_Q={
   air:['["leisure"~"^(park|nature_reserve)$"]']
 };
 async function overpassQuery(ql,timeoutMs){
+  // Overpass instances allow about two concurrent heavy queries per IP; a burst
+  // of parallel calls queues, times out, and retries the next endpoint, which is
+  // how the hex data starved. Run at most two at a time; the rest wait their turn.
+  await ovpAcquire();
+  try{return await overpassQueryRaw(ql,timeoutMs)}finally{ovpRelease()}
+}
+let _ovpActive=0;const _ovpWaiters=[];
+function ovpAcquire(){
+  if(_ovpActive<2){_ovpActive++;return Promise.resolve()}
+  return new Promise(res=>_ovpWaiters.push(res));
+}
+function ovpRelease(){
+  const next=_ovpWaiters.shift();
+  if(next)next();else _ovpActive--;
+}
+async function overpassQueryRaw(ql,timeoutMs){
   const eps=['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter','https://overpass.nchc.org.tw/api/interpreter','https://overpass.private.coffee/api/interpreter'];
   let lastErr=null;
   for(const ep of eps){
@@ -522,7 +538,11 @@ function scoreColor(v,base){return v==null?'#555':base}
 /* ================= hex field (Civ grid) ================= */
 function hexPoly(cx,cy,R){
   const pts=[];const mPerDegLat=111320,mPerDegLon=111320*Math.cos(cy*Math.PI/180);
-  for(let i=0;i<6;i++){const a=Math.PI/180*(60*i);pts.push([cx+(R*Math.cos(a))/mPerDegLon,cy+(R*Math.sin(a))/mPerDegLat])}
+  // vertices start at 30 degrees (pointy top): the grid spacing in buildHexes
+  // (dx = sqrt(3) R across, dy = 1.5 R down, alternate rows offset by dx/2)
+  // tiles exactly this orientation; at 0 degrees the cells overlap and the
+  // fills land off the sites they count
+  for(let i=0;i<6;i++){const a=Math.PI/180*(60*i+30);pts.push([cx+(R*Math.cos(a))/mPerDegLon,cy+(R*Math.sin(a))/mPerDegLat])}
   pts.push(pts[0]);return pts;
 }
 function buildHexes(city){
