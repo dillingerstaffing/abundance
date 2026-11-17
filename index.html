@@ -656,17 +656,33 @@ async function fetchGeom(city,cat){
 async function fetchGeomRaw(city,cat){
   const ck=keyOf(city)+':'+cat.id;
   const hitGeom=cacheGet('geom',ck);if(hitGeom)return hitGeom;
-  const b=boxFor(city);const bbox=b.s+','+b.w+','+b.n+','+b.e;
-  const parts=OVERPASS_Q[cat.id].map(t=>'nwr'+t+'('+bbox+');').join('');
-  const d=await overpassQuery('[out:json][timeout:35];('+parts+');out center 900;',30000,S.current&&keyOf(S.current)===keyOf(city));
-  const pts=[];
-  (d.elements||[]).forEach(el=>{
-    const lat=el.lat!=null?el.lat:(el.center?el.center.lat:null);
-    const lon=el.lon!=null?el.lon:(el.center?el.center.lon:null);
-    if(lat==null||lon==null)return;
-    const t=el.tags||{};
-    pts.push({lon:lon,lat:lat,name:t.name||null,kind:t.amenity||t.shop||t.leisure||t.highway||t.building||t.landuse||t.railway||''});
-  });
+  const b=boxFor(city);
+  // One query over a whole metro box is the request the mapping service
+  // kills: its scan is too big and the reply never lands, which is why
+  // large cities showed empty hexes while small ones filled. Large boxes
+  // are tiled into quadrants, each a quarter of the scan, and the points
+  // merged. The per-endpoint budget is 60 s: a slow but legitimate query
+  // must be allowed to finish instead of being cut at 30 s on every
+  // endpoint in turn.
+  const boxes=[];
+  if((b.n-b.s)*(b.e-b.w)>0.02){
+    const mLat=(b.s+b.n)/2,mLon=(b.w+b.e)/2;
+    boxes.push([b.s,b.w,mLat,mLon],[b.s,mLon,mLat,b.e],[mLat,b.w,b.n,mLon],[mLat,mLon,b.n,b.e]);
+  }else boxes.push([b.s,b.w,b.n,b.e]);
+  const seen=new Set(),pts=[];
+  for(const q of boxes){
+    const bbox=q[0]+','+q[1]+','+q[2]+','+q[3];
+    const parts=OVERPASS_Q[cat.id].map(t=>'nwr'+t+'('+bbox+');').join('');
+    const d=await overpassQuery('[out:json][timeout:45];('+parts+');out center 900;',60000,S.current&&keyOf(S.current)===keyOf(city));
+    (d.elements||[]).forEach(el=>{
+      const lat=el.lat!=null?el.lat:(el.center?el.center.lat:null);
+      const lon=el.lon!=null?el.lon:(el.center?el.center.lon:null);
+      if(lat==null||lon==null)return;
+      const dk=el.type+'/'+el.id;if(seen.has(dk))return;seen.add(dk);
+      const t=el.tags||{};
+      pts.push({lon:lon,lat:lat,name:t.name||null,kind:t.amenity||t.shop||t.leisure||t.highway||t.building||t.landuse||t.railway||''});
+    });
+  }
   const sliced=pts.slice(0,6000);
   if(sliced.length)cacheSet('geom',ck,sliced);
   return sliced;
@@ -825,7 +841,7 @@ async function drawHexes(){
     city.geomState[catId]='loading';
     if(S.drill===2&&S.selHex!=null)fillHexPanel();
     try{city.geom[catId]=await fetchGeom(city,cat);city.geomState[catId]='ok'}
-    catch(e){city.geomState[catId]='fail';toast('Hex site data unavailable for '+cat.name+'. Tap a cell to retry.')}
+    catch(e){city.geomState[catId]='fail';toast('Hex site data unavailable for '+cat.name+'. Tap a cell to retry.');if(S.current===city)scheduleCountsRetry(city)}
   }
   if(S.current!==city||S.hexCat!==catId||city._hexGen!==gen)return;
   const pts=city.geom[catId]||[];
@@ -982,9 +998,12 @@ function scheduleCountsRetry(city){
     city._retryN++;
     // healing covers everything the dossier needs, not just counts: a
     // Census failure at open otherwise stranded the housing row, the
-    // burden figures, and the city's scores for the whole session, and
-    // failed hex site data was never retried at all
-    const missing=()=>CATS.some(c=>!city.counts||city.counts[c.id]==null)||(city.geoid&&!city.acs);
+    // burden figures, and the city's scores for the whole session. Hex
+    // geometry counts as missing too: for a city whose counts came from
+    // the snapshot, a failed site fetch is the ONLY missing piece, and
+    // without it in this condition the chain never started and the
+    // failure was never retried in the background at all.
+    const missing=()=>CATS.some(c=>!city.counts||city.counts[c.id]==null)||(city.geoid&&!city.acs)||(S.current===city&&city.geomState[S.hexCat]==='fail');
     if(!missing()){city._retryN=null;return}
     if(S.current===city&&S.drill>=1){
       await loadCityData(city).catch(()=>{});
