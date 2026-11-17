@@ -1117,13 +1117,24 @@ $('q').addEventListener('input',e=>{
         const div=document.createElement('div');div.innerHTML=r.name+' <span>'+(r.admin1||'')+' · pop '+(r.population?fmtN(r.population):'--')+'</span>';
         div.addEventListener('click',async()=>{
           box.style.display='none';$('q').value=r.name;
-          const city=mkCity({name:r.name,state:r.admin1||'',code:STATE_CODES[r.admin1]||'',lat:r.latitude,lon:r.longitude,population:r.population});
-          city.wageDef=WAGES[city.code]||7.25;
-          toast('Resolving Census place for '+r.name+'...');
-          const pl=await resolvePlace(r.latitude,r.longitude);
-          if(pl)city.geoid=pl.geoid;
-          else toast('No Census place found for '+r.name+'; its Census figures will be unavailable.',3600);
-          cities.set(keyOf(city),city);
+          // Reuse the city that already exists under this key. The old
+          // handler built a brand-new blank city on every tap and stored
+          // it over the loaded one, so searching for a preset city (say
+          // Austin) opened an empty twin with no snapshot floor, no
+          // Census record, and no score, and clobbered the board's copy
+          // too. It loaded in the test browser (pin taps) and never in
+          // the user's (search taps): same city name, two different apps.
+          let city=cities.get(keyOf({name:r.name,code:STATE_CODES[r.admin1]||''}));
+          if(!city){
+            city=mkCity({name:r.name,state:r.admin1||'',code:STATE_CODES[r.admin1]||'',lat:r.latitude,lon:r.longitude,population:r.population});
+            city.wageDef=WAGES[city.code]||7.25;
+            cities.set(keyOf(city),city);
+            seedCity(city);
+            toast('Resolving Census place for '+r.name+'...');
+            const pl=await resolvePlace(r.latitude,r.longitude);
+            if(pl)city.geoid=pl.geoid;
+            else toast('No Census place found for '+r.name+'; its Census figures will be unavailable.',3600);
+          }
           selectCity(city,{fly:true});
         });
         box.appendChild(div);
