@@ -523,17 +523,24 @@ function fmtDT(t){
 function seedCity(city){
   const snap=window.ABUNDANCE_SNAPSHOT;
   let asOf=0,from=null;
+  const snapVals={};
   if(snap&&snap.counts&&snap.counts[keyOf(city)]){
     const sc=snap.counts[keyOf(city)];
-    CATS.forEach(c=>{if(sc[c.id]!=null){city.counts[c.id]=sc[c.id];city.countSrc[c.id]='snapshot'}});
+    CATS.forEach(c=>{if(sc[c.id]!=null){city.counts[c.id]=sc[c.id];city.countSrc[c.id]='snapshot';snapVals[c.id]=sc[c.id]}});
     asOf=snap.asOf;from='snapshot';
   }
   const stamp=cacheStamp('counts',keyOf(city));
   if(stamp>asOf){
     const cached=cacheGet('counts',keyOf(city));
     if(cached&&CATS.some(c=>cached[c.id]!=null)){
-      CATS.forEach(c=>{if(cached[c.id]!=null){city.counts[c.id]=cached[c.id];city.countSrc[c.id]=(cached._src&&cached._src[c.id])||'ohsome'}});
-      asOf=stamp;from='saved';
+      // the snapshot is a floor on values, not just on presence: a cached
+      // 0 never outranks a positive snapshot figure (see no zero burial).
+      // The saved label and date are only claimed when a saved figure is
+      // actually used, so the freshness line never dates snapshot
+      // figures with a cache stamp.
+      let applied=false;
+      CATS.forEach(c=>{if(cached[c.id]!=null&&!(cached[c.id]===0&&snapVals[c.id]>0)){city.counts[c.id]=cached[c.id];city.countSrc[c.id]=(cached._src&&cached._src[c.id])||'ohsome';applied=true}});
+      if(applied){asOf=stamp;from='saved'}
     }
   }
   if(from){city.countsFrom=from;city.countsBaseT=asOf;computeRaw(city)}
@@ -560,7 +567,16 @@ async function refreshCounts(city){
       try{const oc=await overpassCounts(city,missing);Object.keys(oc).forEach(k=>{got[k]=oc[k];city.countSrc[k]='overpass'})}catch(e){}
     }
     let any=false;
-    CATS.forEach(c=>{if(got[c.id]!=null){city.counts[c.id]=got[c.id];city.liveCats.add(c.id);any=true}});
+    CATS.forEach(c=>{
+      if(got[c.id]==null)return;
+      // no zero burial: a live 0 never overwrites a known positive count.
+      // A degraded fallback reply can report zeros for a whole city (a
+      // regional instance, a query that timed out mid-flight); accepting
+      // them buried real figures, dragged the city's score down, and was
+      // then cached on the device as if it were truth.
+      if(got[c.id]===0&&city.counts[c.id]>0)return;
+      city.counts[c.id]=got[c.id];city.liveCats.add(c.id);any=true;
+    });
     if(any){
       city.countsLiveT=Date.now();
       const snap2={};CATS.forEach(c=>{if(city.counts[c.id]!=null)snap2[c.id]=city.counts[c.id]});snap2._src=Object.assign({},city.countSrc);
@@ -596,7 +612,7 @@ function ovpRelease(){
   if(next)next();else _ovpActive--;
 }
 async function overpassQueryRaw(ql,timeoutMs){
-  const eps=['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter','https://overpass.osm.ch/api/interpreter','https://overpass.nchc.org.tw/api/interpreter','https://overpass.openstreetmap.fr/api/interpreter','https://overpass.private.coffee/api/interpreter'];
+  const eps=['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter','https://overpass.nchc.org.tw/api/interpreter','https://overpass.private.coffee/api/interpreter'];
   let lastErr=null;
   for(const ep of eps){
     const host=new URL(ep).hostname;
