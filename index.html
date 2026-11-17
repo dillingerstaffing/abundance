@@ -1114,7 +1114,7 @@ $('q').addEventListener('input',e=>{
       const rs=(d.results||[]).filter(r=>r.country_code==='US');
       box.innerHTML='';if(!rs.length){box.style.display='none';return}
       rs.forEach(r=>{
-        const div=document.createElement('div');div.innerHTML=r.name+' <span>'+(r.admin1||'')+' · pop '+(r.population?fmtN(r.population):'--')+'</span>';
+        const div=document.createElement('div');div.innerHTML=r.name+' <span>'+(r.admin1||'')+'</span>';
         div.addEventListener('click',async()=>{
           box.style.display='none';$('q').value=r.name;
           // Reuse the city that already exists under this key. The old
