@@ -377,9 +377,12 @@ async function fetchCounts(city){
     await new Promise(r=>setTimeout(r,2500));
     await Promise.all(want().map(async cat=>{try{await one(cat)}catch(e){}}));
   }
-  // second source: if ohsome is down, count the same OpenStreetMap data via Overpass,
-  // in parallel, so an ohsome outage degrades the load instead of gutting the dossier
-  await Promise.all(want().map(async cat=>{
+  // second source: if ohsome is down, count the same OpenStreetMap data via Overpass.
+  // Only for the city on screen (or a city the recovery sweep flags): Overpass
+  // queries are heavy, and running them for all 15 cities through two slots
+  // stalls the whole board; background cities rely on ohsome plus the sweep.
+  const allowFb=(S.current&&keyOf(S.current)===keyOf(city))||city._fbOnce;
+  if(allowFb)await Promise.all(want().map(async cat=>{
     try{out[cat.id]=await overpassCount(city,cat);city.countSrc[cat.id]='overpass'}catch(e){}
   }));
   CATS.forEach(c=>{if(out[c.id]==null)out[c.id]=(city.counts&&city.counts[c.id]!=null)?city.counts[c.id]:null});
@@ -476,11 +479,16 @@ function computeRaw(city){
 function buildRanges(){
   const list=PRESETS.map(p=>cities.get(keyOf(p))).filter(c=>c.raw&&c.raw.housing!=null);
   if(list.length<3)return;
-  const r={};
+  const r={};let fieldN=Infinity;
   ['housing','food','energy','transport','health','parks'].forEach(k=>{
     const vs=list.map(c=>c.raw[k]).filter(v=>v!=null);
+    fieldN=Math.min(fieldN,vs.length);
     if(vs.length)r[k]={min:Math.min.apply(null,vs),max:Math.max.apply(null,vs)};
   });
+  // scores are ranks against the reference field; with only a few cities in,
+  // the ranks are provisional midpoints that collapse as the field fills, so
+  // no score is shown until at least 8 cities report in every category
+  S.fieldN=fieldN===Infinity?0:fieldN;
   S.ranges=r;list.forEach(scoreCity);PRESETS.forEach(p=>{const c=cities.get(keyOf(p));if(c)updatePin(c)});
   if(S.current){const db=$('dbody');const st=db?db.scrollTop:0;scoreCity(S.current);renderDossier(S.current);if(db)db.scrollTop=st}
 }
@@ -493,6 +501,7 @@ function norm(k,v){
 }
 function scoreCity(city){
   if(!city.raw||city.raw.housing===undefined)computeRaw(city);
+  if((S.fieldN||0)<8){city.scores={};city.composite=null;return}
   const s={};
   s.housing=norm('housing',city.raw.housing);
   s.food=norm('food',city.raw.food);
@@ -639,6 +648,11 @@ function renderDossier(city){
   $('y-aqi').textContent=city.aq?fmtN(city.aq.aqi):'--';
   $('y-solar').innerHTML=city.wx?fmtN(city.wx.solar)+' <small>W/m2</small>':'--';
   const rows=$('catrows');rows.innerHTML='';
+  if((S.fieldN||0)<8&&(city.acs||CATS.some(c=>city.counts&&city.counts[c.id]!=null))){
+    const note=document.createElement('div');note.className='catrow';
+    note.innerHTML='<div class="vals">Measured values are shown below. Scores appear once at least 8 of the 15 reference cities have reported in every category, so a rank is never computed against a near-empty field.</div>';
+    rows.appendChild(note);
+  }
   CATS.forEach(cat=>{
     const sc=city.scores?city.scores[cat.id]:null;
     const cnt=city.counts?city.counts[cat.id]:undefined;
@@ -730,7 +744,9 @@ function scheduleCountsRetry(city){
     try{city.counts=await fetchCounts(city)}catch(e){}
     computeRaw(city);buildRanges();updatePin(city);
     if(S.current===city)renderDossier(city);
-    if(CATS.some(c=>!city.counts||city.counts[c.id]==null)&&city._retryN<5){
+    const stillMissing=CATS.some(c=>!city.counts||city.counts[c.id]==null);
+    if(!stillMissing&&S.current===city)toast(city.name+' ready',1400);
+    if(stillMissing&&city._retryN<5){
       city._retryT=setTimeout(step,city._retryN<2?45000:120000);
     }else city._retryN=null;
   };
@@ -934,7 +950,9 @@ document.addEventListener('keydown',e=>{
     await Promise.all([0,1].map(async()=>{
       while(q2.length){
         const c=q2.shift();
+        c._fbOnce=true;
         try{c.counts=await fetchCounts(c)}catch(e){}
+        c._fbOnce=false;
         computeRaw(c);buildRanges();updatePin(c);if(S.drill===0)renderNation();
       }
     }));
