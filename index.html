@@ -244,7 +244,7 @@ button{font-family:var(--mono);cursor:pointer;color:var(--ink);background:none;b
       <button id="hexup" class="hbtn" style="margin-top:8px">DIG UP TO CITY</button></div>
     <div id="catrows"></div>
     <div id="blsstrip">National price context (BLS, monthly): loading...</div>
-    <div id="dfoot">Sources: US Census Bureau ACS via Census Reporter; OpenStreetMap via ohsome API (counts, with an Overpass count fallback) and Overpass API (hex geometry); Open-Meteo weather and air quality; US DOL wage table; BLS CPI. Every figure carries its source. A figure that fails to load shows as unavailable, never estimated. <a href="#" id="footmethod">Full method</a></div>
+    <div id="dfoot">Sources: US Census Bureau ACS via Census Reporter; OpenStreetMap via ohsome API (counts, with an Overpass count fallback) and Overpass API (hex geometry); Open-Meteo weather and air quality; US DOL wage table; BLS CPI. Every figure carries its source. A figure that fails to load shows as unavailable, never estimated. Counts and hex sites are cached on your device for a day and Census figures for a week, and the page backs off politely when a free service is busy, so repeat visits cost those services nothing. <a href="#" id="footmethod">Full method</a></div>
   </div>
 </aside>
 
@@ -324,9 +324,54 @@ const fmtN=n=>n==null||isNaN(n)?'--':Math.round(n).toLocaleString('en-US');
 const fmt1=n=>n==null||isNaN(n)?'--':(Math.round(n*10)/10).toLocaleString('en-US');
 function toast(msg,ms){const t=$('toast');t.textContent=msg;t.classList.add('show');clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove('show'),ms||2600)}
 async function fetchJSON(url,ms){
+  const host=new URL(url).hostname;
+  hostGate(host);
   const ctl=new AbortController();const h=setTimeout(()=>ctl.abort(),ms||20000);
-  try{const r=await fetch(url,{signal:ctl.signal});if(!r.ok)throw new Error('HTTP '+r.status);return await r.json()}
+  try{
+    const r=await fetch(url,{signal:ctl.signal});
+    if(!r.ok){
+      if(r.status===429||r.status===503){const ra=parseInt(r.headers.get('Retry-After')||'',10);hostFail(host,isNaN(ra)?null:ra)}
+      else hostFail(host,null);
+      throw new Error('HTTP '+r.status);
+    }
+    hostOk(host);
+    return await r.json();
+  }catch(e){
+    if(e&&/^HTTP /.test(e.message))throw e;
+    hostFail(host,null);
+    throw e;
+  }
   finally{clearTimeout(h)}
+}
+/* Polite-client rules for the free shared services this page reads:
+   - a per-host circuit breaker: after 3 consecutive failures the host is
+     left alone for a cooling-off period (60s, doubling to at most 4 min),
+     and a 429's Retry-After is always honoured. During cooldown, calls
+     fail locally and cost the service nothing.
+   - results are cached in localStorage (counts and hex sites for a day,
+     Census for a week): OpenStreetMap counts for a city barely move in a
+     day, and a returning visitor should cost the services nothing. */
+const _hosts={};
+function hostGate(host){const s=_hosts[host];if(s&&s.until>Date.now())throw new Error('cooling down: '+host)}
+function hostFail(host,retryAfterSec){
+  const s=_hosts[host]||(_hosts[host]={fails:0,until:0});
+  s.fails++;
+  if(retryAfterSec!=null)s.until=Math.max(s.until,Date.now()+retryAfterSec*1000);
+  else if(s.fails>=3)s.until=Date.now()+Math.min(240000,60000*Math.pow(2,s.fails-3));
+}
+function hostOk(host){const s=_hosts[host];if(s){s.fails=0;s.until=0}}
+const CACHE_KEY='abundance.cache.v1';
+let _cache=null;
+function cacheLoad(){if(_cache)return _cache;try{_cache=JSON.parse(localStorage.getItem(CACHE_KEY)||'{}')}catch(e){_cache={}}if(!_cache||typeof _cache!=='object')_cache={};return _cache}
+function cacheGet(kind,id){
+  const c=cacheLoad();const e=c[kind+':'+id];if(!e)return null;
+  if(Date.now()-e.t>(kind==='acs'?7*864e5:864e5)){delete c[kind+':'+id];return null}
+  return e.v;
+}
+function cacheSet(kind,id,v){
+  const c=cacheLoad();c[kind+':'+id]={t:Date.now(),v};
+  try{localStorage.setItem(CACHE_KEY,JSON.stringify(c))}
+  catch(err){Object.keys(c).forEach(k=>{if(k.indexOf('geom:')===0)delete c[k]});try{localStorage.setItem(CACHE_KEY,JSON.stringify(c))}catch(err2){}}
 }
 function boxFor(city){
   const pop=city.acs?city.acs.pop:(city.popHint||50000);
@@ -337,13 +382,16 @@ function boxFor(city){
 /* ================= fetchers ================= */
 async function fetchACS(city){
   if(!city.geoid)return null;
+  const hit=cacheGet('acs',city.geoid);if(hit)return hit;
   const u='https://api.censusreporter.org/1.0/data/show/latest?table_ids=B01003,B19013,B25064,B25077,B25002,B25001&geo_ids=16000US'+city.geoid;
   const d=await fetchJSON(u,20000);const g=d.data['16000US'+city.geoid];if(!g)throw new Error('no ACS');
   const e=(t,c)=>{const x=g[t];return x&&x.estimate?x.estimate[c]:null};
-  return{pop:e('B01003','B01003001'),income:e('B19013','B19013001'),rent:e('B25064','B25064001'),
+  const out={pop:e('B01003','B01003001'),income:e('B19013','B19013001'),rent:e('B25064','B25064001'),
     home:e('B25077','B25077001'),units:e('B25001','B25001001'),
     vacancy:(e('B25002','B25002001')&&e('B25002','B25002003')!=null)?(e('B25002','B25002003')/e('B25002','B25002001')*100):null,
     name:d.geography['16000US'+city.geoid].name};
+  cacheSet('acs',city.geoid,out);
+  return out;
 }
 async function fetchWX(city){
   const u='https://api.open-meteo.com/v1/forecast?latitude='+city.lat+'&longitude='+city.lon+'&current=temperature_2m,wind_speed_10m,shortwave_radiation,weather_code&timezone=auto';
@@ -367,25 +415,33 @@ async function fetchCounts(city){
   // let a later flaky round erase categories an earlier round had landed.
   const out={};
   CATS.forEach(c=>{if(city.counts&&city.counts[c.id]!=null)out[c.id]=city.counts[c.id]});
+  // yesterday's counts are still good today: serve what is missing from the
+  // local cache before asking the services for anything
+  if(CATS.some(c=>out[c.id]==null)){
+    const cached=cacheGet('counts',keyOf(city));
+    if(cached)CATS.forEach(c=>{if(out[c.id]==null&&cached[c.id]!=null){out[c.id]=cached[c.id];if(cached._src&&cached._src[c.id])city.countSrc[c.id]=cached._src[c.id]}});
+  }
   const one=async cat=>{
     const d=await fetchJSON(ohsomeURL(city,cat,false),12000);out[cat.id]=d.result[0].value;city.countSrc[cat.id]='ohsome';
   };
   const want=()=>CATS.filter(c=>out[c.id]==null);
+  // one attempt per category per call, and no immediate retry round: spaced
+  // retries live in the retry chain and the board sweeps, which is what
+  // keeps this client inside the services' fair-use limits
   await Promise.all(want().map(async cat=>{try{await one(cat)}catch(e){}}));
-  // one delayed retry for whatever failed, so a throttled burst does not strand a category
-  if(want().length){
-    await new Promise(r=>setTimeout(r,2500));
-    await Promise.all(want().map(async cat=>{try{await one(cat)}catch(e){}}));
-  }
-  // second source: if ohsome is down, count the same OpenStreetMap data via Overpass.
-  // Only for the city on screen (or a city the recovery sweep flags): Overpass
-  // queries are heavy, and running them for all 15 cities through two slots
-  // stalls the whole board; background cities rely on ohsome plus the sweep.
+  // second source: if ohsome is down, count the same OpenStreetMap data via
+  // Overpass as ONE combined query for every missing category. Only for the
+  // city on screen (or a city the recovery sweep flags); background cities
+  // rely on ohsome plus the sweeps.
   const allowFb=(S.current&&keyOf(S.current)===keyOf(city))||city._fbOnce;
-  if(allowFb)await Promise.all(want().map(async cat=>{
-    try{out[cat.id]=await overpassCount(city,cat);city.countSrc[cat.id]='overpass'}catch(e){}
-  }));
+  if(allowFb&&want().length){
+    try{const oc=await overpassCounts(city,want());Object.keys(oc).forEach(k=>{out[k]=oc[k];city.countSrc[k]='overpass'})}catch(e){}
+  }
   CATS.forEach(c=>{if(out[c.id]==null)out[c.id]=(city.counts&&city.counts[c.id]!=null)?city.counts[c.id]:null});
+  if(CATS.some(c=>out[c.id]!=null)){
+    const snap={};CATS.forEach(c=>{if(out[c.id]!=null)snap[c.id]=out[c.id]});snap._src=Object.assign({},city.countSrc);
+    cacheSet('counts',keyOf(city),snap);
+  }
   return out;
   })();
   try{return await city._fc}finally{city._fc=null}
@@ -419,25 +475,38 @@ async function overpassQueryRaw(ql,timeoutMs){
   const eps=['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter','https://overpass.nchc.org.tw/api/interpreter','https://overpass.private.coffee/api/interpreter'];
   let lastErr=null;
   for(const ep of eps){
+    const host=new URL(ep).hostname;
     try{
+      hostGate(host);
       const ctl=new AbortController();const h=setTimeout(()=>ctl.abort(),timeoutMs||45000);
       const r=await fetch(ep,{method:'POST',signal:ctl.signal,headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'data='+encodeURIComponent(ql)});
       clearTimeout(h);
-      if(!r.ok)throw new Error('HTTP '+r.status);
+      if(!r.ok){
+        if(r.status===429||r.status===503){const ra=parseInt(r.headers.get('Retry-After')||'',10);hostFail(host,isNaN(ra)?null:ra)}
+        else hostFail(host,null);
+        throw new Error('HTTP '+r.status);
+      }
+      hostOk(host);
       return await r.json();
-    }catch(e){lastErr=e}
+    }catch(e){lastErr=e;if(!(e&&(/^HTTP /.test(e.message)||/^cooling down/.test(e.message))))hostFail(host,null)}
   }
   throw lastErr||new Error('overpass failed');
 }
-async function overpassCount(city,cat){
+async function overpassCounts(city,cats){
+  // one combined query counts every missing category in a single request:
+  // the reply's count elements arrive in statement order
   const b=boxFor(city);const bbox=b.s+','+b.w+','+b.n+','+b.e;
-  const parts=OVERPASS_Q[cat.id].map(t=>'nwr'+t+'('+bbox+');').join('');
-  const d=await overpassQuery('[out:json][timeout:35];('+parts+');out count;',15000,S.current&&keyOf(S.current)===keyOf(city));
-  const el=(d.elements||[]).find(e=>e.type==='count');
-  if(!el||!el.tags||el.tags.total==null)throw new Error('no count in overpass reply');
-  return parseInt(el.tags.total,10);
+  const stmts=cats.map(cat=>{const parts=OVERPASS_Q[cat.id].map(t=>'nwr'+t+'('+bbox+');').join('');return '('+parts+');out count;'}).join('');
+  const d=await overpassQuery('[out:json][timeout:35];'+stmts,25000,S.current&&keyOf(S.current)===keyOf(city));
+  const els=(d.elements||[]).filter(e=>e.type==='count');
+  if(els.length!==cats.length)throw new Error('combined count reply mismatch');
+  const out={};
+  cats.forEach((cat,i)=>{const el=els[i];if(!el.tags||el.tags.total==null)throw new Error('no count in overpass reply');out[cat.id]=parseInt(el.tags.total,10)});
+  return out;
 }
 async function fetchGeom(city,cat){
+  const ck=keyOf(city)+':'+cat.id;
+  const hitGeom=cacheGet('geom',ck);if(hitGeom)return hitGeom;
   const b=boxFor(city);const bbox=b.s+','+b.w+','+b.n+','+b.e;
   const parts=OVERPASS_Q[cat.id].map(t=>'nwr'+t+'('+bbox+');').join('');
   const d=await overpassQuery('[out:json][timeout:35];('+parts+');out center 900;',undefined,S.current&&keyOf(S.current)===keyOf(city));
@@ -449,7 +518,9 @@ async function fetchGeom(city,cat){
     const t=el.tags||{};
     pts.push({lon:lon,lat:lat,name:t.name||null,kind:t.amenity||t.shop||t.leisure||t.highway||t.building||t.landuse||t.railway||''});
   });
-  return pts.slice(0,6000);
+  const sliced=pts.slice(0,6000);
+  if(sliced.length)cacheSet('geom',ck,sliced);
+  return sliced;
 }
 async function resolvePlace(lat,lon){
   for(const layer of [4,5]){
@@ -750,11 +821,13 @@ function scheduleCountsRetry(city){
         toast(city.name+' ready',1400);city._retryN=null;return;
       }
     }
-    if(city._retryN<12){
-      city._retryT=setTimeout(step,city._retryN<2?45000:120000);
+    if(city._retryN<8){
+      // polite spacing: 1 min, 3 min, then every 8 min. A service that is
+      // throttling this address gets room to recover instead of a hammer.
+      city._retryT=setTimeout(step,city._retryN<=1?60000:(city._retryN===2?180000:480000));
     }else city._retryN=null;
   };
-  city._retryT=setTimeout(step,45000);
+  city._retryT=setTimeout(step,60000);
 }
 function goNation(){
   S.drill=0;S.current=null;S.selHex=null;$('hexpanel').style.display='none';
@@ -943,6 +1016,7 @@ document.addEventListener('keydown',e=>{
       const p=queue.shift();const c=cities.get(keyOf(p));
       try{c.counts=await fetchCounts(c)}catch(e){}
       computeRaw(c);buildRanges();updatePin(c);if(S.drill===0)renderNation();
+      await new Promise(r=>setTimeout(r,600)); // pace the board's requests
     }
   }));
   // recovery sweep: a city whose counts failed both rounds is retried once more,
@@ -963,12 +1037,12 @@ document.addEventListener('keydown',e=>{
     const still=PRESETS.map(p=>cities.get(keyOf(p))).filter(c=>c&&CATS.some(k=>!c.counts||c.counts[k.id]==null));
     if(still.length)toast('Some reference cities could not finish loading counts. Tap a city pin to retry it.',7000);
   }
-  // re-sweeps: while any city is still stranded, sweep again every 4 minutes
-  // (up to 4 more times), so a long throttle window does not strand the board
-  for(let round=0;round<4;round++){
+  // re-sweeps: while any city is still stranded, sweep again every 10 minutes
+  // (up to 3 more times), so a long throttle window does not strand the board
+  for(let round=0;round<3;round++){
     const left=PRESETS.map(p=>cities.get(keyOf(p))).filter(c=>c&&CATS.some(k=>!c.counts||c.counts[k.id]==null));
     if(!left.length)break;
-    await new Promise(r=>setTimeout(r,240000));
+    await new Promise(r=>setTimeout(r,600000));
     const q3=left.slice();
     await Promise.all([0,1].map(async()=>{
       while(q3.length){
