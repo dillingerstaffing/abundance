@@ -1308,15 +1308,23 @@ if(new URLSearchParams(location.search).has('harvest')){
     document.body.appendChild(pre);
     const log=s=>{pre.textContent+=s+'\n'};
     const G={};let total=0,done=0,failed=[];
+    const sleep=ms=>new Promise(r=>setTimeout(r,ms));
     for(const p of PRESETS){
       const city=cities.get(keyOf(p));G[keyOf(p)]={};
       for(const cat of CATS){
-        try{
-          const pts=await fetchGeom(city,cat);
+        // bounded and paced: one category gets at most 200 s (a hanging
+        // query must not stall the whole harvest, as one did for 14
+        // minutes in the first run), an empty reply counts as a failure,
+        // and a pause separates categories so the run does not trip the
+        // service's rate limiter the way the first back-to-back run did
+        let pts=null;
+        try{pts=await Promise.race([fetchGeom(city,cat),new Promise((_,rej)=>setTimeout(()=>rej(new Error('harvest timeout')),200000))])}catch(e){}
+        if(pts&&pts.length){
           G[keyOf(p)][cat.id]=pts.map(pt=>[Math.round(pt.lon*1e5)/1e5,Math.round(pt.lat*1e5)/1e5,pt.name||'',pt.kind||'']);
           total+=pts.length;done++;
           log('OK   '+p.name+' / '+cat.id+': '+pts.length);
-        }catch(e){failed.push(p.name+'/'+cat.id);log('FAIL '+p.name+' / '+cat.id)}
+        }else{failed.push(p.name+'/'+cat.id);log('FAIL '+p.name+' / '+cat.id)}
+        await sleep(12000);
       }
     }
     const blob=new Blob(['window.ABUNDANCE_GEOM='+JSON.stringify(G)+';\n'],{type:'text/javascript'});
