@@ -689,6 +689,25 @@ async function selectCity(city,opts){
   renderDossier(city);drawHexes();
   const missingC=!city.acs||CATS.some(c=>!city.counts||city.counts[c.id]==null);
   toast(missingC?city.name+' open, some counts unavailable. Tap a marked row to retry.':city.name+' ready',missingC?4200:1400);
+  if(missingC)scheduleCountsRetry(city);
+}
+function scheduleCountsRetry(city){
+  // while a city stays open with counts missing, keep retrying on a slow clock:
+  // a flapping counts service then completes the dossier on its own
+  if(city._retryN!=null)return;
+  city._retryN=0;
+  const step=async()=>{
+    city._retryN++;
+    if(S.current!==city||S.drill===0){city._retryN=null;return}
+    if(!CATS.some(c=>!city.counts||city.counts[c.id]==null)){city._retryN=null;return}
+    try{city.counts=await fetchCounts(city)}catch(e){}
+    computeRaw(city);buildRanges();updatePin(city);
+    if(S.current===city)renderDossier(city);
+    if(CATS.some(c=>!city.counts||city.counts[c.id]==null)&&city._retryN<5){
+      city._retryT=setTimeout(step,city._retryN<2?45000:120000);
+    }else city._retryN=null;
+  };
+  city._retryT=setTimeout(step,45000);
 }
 function goNation(){
   S.drill=0;S.current=null;S.selHex=null;$('hexpanel').style.display='none';
