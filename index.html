@@ -244,7 +244,7 @@ button{font-family:var(--mono);cursor:pointer;color:var(--ink);background:none;b
       <button id="hexup" class="hbtn" style="margin-top:8px">DIG UP TO CITY</button></div>
     <div id="catrows"></div>
     <div id="blsstrip">National price context (BLS, monthly): loading...</div>
-    <div id="dfoot">Sources: US Census Bureau ACS via Census Reporter; OpenStreetMap via ohsome API (counts) and Overpass API (hex geometry); Open-Meteo weather and air quality; US DOL wage table; BLS CPI. Every figure carries its source. A figure that fails to load shows as unavailable, never estimated. <a href="#" id="footmethod">Full method</a></div>
+    <div id="dfoot">Sources: US Census Bureau ACS via Census Reporter; OpenStreetMap via ohsome API (counts, with an Overpass count fallback) and Overpass API (hex geometry); Open-Meteo weather and air quality; US DOL wage table; BLS CPI. Every figure carries its source. A figure that fails to load shows as unavailable, never estimated. <a href="#" id="footmethod">Full method</a></div>
   </div>
 </aside>
 
@@ -316,7 +316,7 @@ const PRESETS=[
 const S={lens:'overview',drill:0,current:null,wage:15.92,wageDefault:15.92,ranges:null,hexCat:null,hexData:null,selHex:null,flying:false,styleDark:true};
 const cities=new Map(); // key: name+code -> city object
 const keyOf=c=>c.name+'|'+c.code;
-function mkCity(p){return Object.assign({acs:null,wx:null,aq:null,counts:{},raw:{},scores:{},composite:null,geom:{},geomState:{},popHint:p.population||null},p)}
+function mkCity(p){return Object.assign({acs:null,wx:null,aq:null,counts:{},countSrc:{},raw:{},scores:{},composite:null,geom:{},geomState:{},popHint:p.population||null},p)}
 PRESETS.forEach(p=>{const c=mkCity(p);c.wageDef=p.wage||WAGES[p.code];cities.set(keyOf(c),c)});
 /* ================= helpers ================= */
 const fmt$=n=>n==null||isNaN(n)?'--':'$'+Math.round(n).toLocaleString('en-US');
@@ -362,14 +362,20 @@ function ohsomeURL(city,cat,geom){
 async function fetchCounts(city){
   const out={};
   const one=async cat=>{
-    const d=await fetchJSON(ohsomeURL(city,cat,false),20000);out[cat.id]=d.result[0].value;
+    const d=await fetchJSON(ohsomeURL(city,cat,false),20000);out[cat.id]=d.result[0].value;city.countSrc[cat.id]='ohsome';
   };
   await Promise.all(CATS.map(async cat=>{try{await one(cat)}catch(e){out[cat.id]=null}}));
   // one delayed retry for whatever failed, so a throttled burst does not strand a category
-  const missing=CATS.filter(c=>out[c.id]==null);
+  let missing=CATS.filter(c=>out[c.id]==null);
   if(missing.length){
     await new Promise(r=>setTimeout(r,2500));
     await Promise.all(missing.map(async cat=>{try{await one(cat)}catch(e){}}));
+  }
+  // second source: if ohsome is down, count the same OpenStreetMap data via Overpass,
+  // sequentially, so an ohsome outage degrades the load instead of gutting the dossier
+  missing=CATS.filter(c=>out[c.id]==null);
+  for(const cat of missing){
+    try{out[cat.id]=await overpassCount(city,cat);city.countSrc[cat.id]='overpass'}catch(e){}
   }
   return out;
 }
@@ -381,22 +387,32 @@ const OVERPASS_Q={
   health:['["amenity"~"^(hospital|clinic|pharmacy|doctors|dentist)$"]'],
   air:['["leisure"~"^(park|nature_reserve)$"]']
 };
-async function fetchGeom(city,cat){
-  const b=boxFor(city);const bbox=b.s+','+b.w+','+b.n+','+b.e;
-  const parts=OVERPASS_Q[cat.id].map(t=>'nwr'+t+'('+bbox+');').join('');
-  const ql='[out:json][timeout:35];('+parts+');out center 900;';
+async function overpassQuery(ql){
   const eps=['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter','https://overpass.nchc.org.tw/api/interpreter'];
-  let d=null,lastErr=null;
+  let lastErr=null;
   for(const ep of eps){
     try{
       const ctl=new AbortController();const h=setTimeout(()=>ctl.abort(),45000);
       const r=await fetch(ep,{method:'POST',signal:ctl.signal,headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'data='+encodeURIComponent(ql)});
       clearTimeout(h);
       if(!r.ok)throw new Error('HTTP '+r.status);
-      d=await r.json();break;
+      return await r.json();
     }catch(e){lastErr=e}
   }
-  if(!d)throw lastErr||new Error('overpass failed');
+  throw lastErr||new Error('overpass failed');
+}
+async function overpassCount(city,cat){
+  const b=boxFor(city);const bbox=b.s+','+b.w+','+b.n+','+b.e;
+  const parts=OVERPASS_Q[cat.id].map(t=>'nwr'+t+'('+bbox+');').join('');
+  const d=await overpassQuery('[out:json][timeout:35];('+parts+');out count;');
+  const el=(d.elements||[]).find(e=>e.type==='count');
+  if(!el||!el.tags||el.tags.total==null)throw new Error('no count in overpass reply');
+  return parseInt(el.tags.total,10);
+}
+async function fetchGeom(city,cat){
+  const b=boxFor(city);const bbox=b.s+','+b.w+','+b.n+','+b.e;
+  const parts=OVERPASS_Q[cat.id].map(t=>'nwr'+t+'('+bbox+');').join('');
+  const d=await overpassQuery('[out:json][timeout:35];('+parts+');out center 900;');
   const pts=[];
   (d.elements||[]).forEach(el=>{
     const lat=el.lat!=null?el.lat:(el.center?el.center.lat:null);
@@ -601,7 +617,7 @@ function renderDossier(city){
     const div=document.createElement('div');div.className='catrow'+(S.lens===cat.id?' hot':'');
     div.innerHTML='<div class="r1"><span class="dot" style="background:'+cat.color+'"></span><span class="nm">'+cat.name+'</span><span class="sc num" style="color:'+cat.color+'">'+(sc==null?'--':sc)+'</span></div>'+
       '<div class="bar"><i style="width:'+(sc==null?0:sc)+'%;background:'+cat.color+'"></i></div>'+
-      '<div class="vals">'+catVals(city,cat)+'</div><div class="src">'+cat.src+(state==='loading'?' · loading':state==='fail'?' · unavailable, tap row to retry':'')+'</div>';
+      '<div class="vals">'+catVals(city,cat)+'</div><div class="src">'+cat.src+(state==='ok'&&city.countSrc&&city.countSrc[cat.id]==='overpass'?' · via Overpass fallback':'')+(state==='loading'?' · loading':state==='fail'?' · unavailable, tap row to retry':'')+'</div>';
     div.addEventListener('click',()=>{
       if(state==='fail'){toast('Retrying '+cat.name+' counts...');loadCityData(city).then(()=>{if(S.current===city)renderDossier(city)})}
       else setLens(cat.id);
@@ -658,7 +674,8 @@ async function selectCity(city,opts){
   await loadCityData(city);
   if(S.current!==city)return;
   renderDossier(city);drawHexes();
-  toast(city.name+' ready',1400);
+  const missingC=!city.acs||CATS.some(c=>!city.counts||city.counts[c.id]==null);
+  toast(missingC?city.name+' open, some counts unavailable. Tap a marked row to retry.':city.name+' ready',missingC?4200:1400);
 }
 function goNation(){
   S.drill=0;S.current=null;S.selHex=null;$('hexpanel').style.display='none';
