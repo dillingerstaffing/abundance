@@ -360,6 +360,8 @@ function ohsomeURL(city,cat,geom){
   return 'https://api.ohsome.org/v1/elements/'+(geom?'geometry':'count')+'?bboxes='+bb+'&filter='+encodeURIComponent(cat.osm);
 }
 async function fetchCounts(city){
+  if(city._fc)return city._fc;
+  city._fc=(async()=>{
   const out={};
   const one=async cat=>{
     const d=await fetchJSON(ohsomeURL(city,cat,false),20000);out[cat.id]=d.result[0].value;city.countSrc[cat.id]='ohsome';
@@ -372,12 +374,14 @@ async function fetchCounts(city){
     await Promise.all(missing.map(async cat=>{try{await one(cat)}catch(e){}}));
   }
   // second source: if ohsome is down, count the same OpenStreetMap data via Overpass,
-  // sequentially, so an ohsome outage degrades the load instead of gutting the dossier
+  // in parallel, so an ohsome outage degrades the load instead of gutting the dossier
   missing=CATS.filter(c=>out[c.id]==null);
-  for(const cat of missing){
+  await Promise.all(missing.map(async cat=>{
     try{out[cat.id]=await overpassCount(city,cat);city.countSrc[cat.id]='overpass'}catch(e){}
-  }
+  }));
   return out;
+  })();
+  try{return await city._fc}finally{city._fc=null}
 }
 const OVERPASS_Q={
   housing:['["building"="apartments"]','["landuse"="construction"]'],
@@ -387,12 +391,12 @@ const OVERPASS_Q={
   health:['["amenity"~"^(hospital|clinic|pharmacy|doctors|dentist)$"]'],
   air:['["leisure"~"^(park|nature_reserve)$"]']
 };
-async function overpassQuery(ql){
+async function overpassQuery(ql,timeoutMs){
   const eps=['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter','https://overpass.nchc.org.tw/api/interpreter'];
   let lastErr=null;
   for(const ep of eps){
     try{
-      const ctl=new AbortController();const h=setTimeout(()=>ctl.abort(),45000);
+      const ctl=new AbortController();const h=setTimeout(()=>ctl.abort(),timeoutMs||45000);
       const r=await fetch(ep,{method:'POST',signal:ctl.signal,headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'data='+encodeURIComponent(ql)});
       clearTimeout(h);
       if(!r.ok)throw new Error('HTTP '+r.status);
@@ -404,7 +408,7 @@ async function overpassQuery(ql){
 async function overpassCount(city,cat){
   const b=boxFor(city);const bbox=b.s+','+b.w+','+b.n+','+b.e;
   const parts=OVERPASS_Q[cat.id].map(t=>'nwr'+t+'('+bbox+');').join('');
-  const d=await overpassQuery('[out:json][timeout:35];('+parts+');out count;');
+  const d=await overpassQuery('[out:json][timeout:35];('+parts+');out count;',15000);
   const el=(d.elements||[]).find(e=>e.type==='count');
   if(!el||!el.tags||el.tags.total==null)throw new Error('no count in overpass reply');
   return parseInt(el.tags.total,10);
@@ -658,9 +662,18 @@ async function loadCityData(city){
   if(city.geoid&&!city.acs)jobs.push(fetchACS(city).then(a=>{city.acs=a}).catch(()=>{city.acs=null}));
   if(!city.wx||Date.now()-(city._wxT||0)>600000)jobs.push(fetchWX(city).then(w=>{city.wx=w;city._wxT=Date.now()}).catch(()=>{}));
   if(!city.aq||Date.now()-(city._aqT||0)>600000)jobs.push(fetchAQ(city).then(a=>{city.aq=a;city._aqT=Date.now()}).catch(()=>{}));
-  if(CATS.some(c=>city.counts[c.id]==null))jobs.push(fetchCounts(city).then(cn=>{city.counts=cn}).catch(()=>{}));
+  const needCounts=CATS.some(c=>city.counts[c.id]==null);
+  // phase 1: Census, weather and air land first and render, so a slow or dead
+  // counts service can never hold the whole dossier hostage
   await Promise.allSettled(jobs);
   computeRaw(city);scoreCity(city);updatePin(city);
+  if(S.current===city)renderDossier(city);
+  // phase 2: counts, with their own retries and fallback source
+  if(needCounts){
+    try{city.counts=await fetchCounts(city)}catch(e){}
+    computeRaw(city);scoreCity(city);updatePin(city);
+    if(S.current===city)renderDossier(city);
+  }
 }
 async function selectCity(city,opts){
   opts=opts||{};
@@ -847,8 +860,9 @@ document.addEventListener('keydown',e=>{
   // home city first: its counts land and it opens before the rest stream in
   const home=cities.get(keyOf(PRESETS[0]));
   if(home){
-    try{home.counts=await fetchCounts(home)}catch(e){}
-    computeRaw(home);buildRanges();
+    // open the home city immediately on its Census/weather/air data; its counts
+    // stream in behind the open dossier via loadCityData instead of gating it
+    buildRanges();
     selectCity(home,{fly:true});
   }
   // slow pass for the remaining cities, two at a time; scores re-normalize as they land
