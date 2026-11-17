@@ -321,7 +321,7 @@ const PRESETS=[
 const S={lens:'overview',drill:0,current:null,wage:15.92,wageDefault:15.92,ranges:null,hexCat:null,hexData:null,selHex:null,flying:false,styleDark:true};
 const cities=new Map(); // key: name+code -> city object
 const keyOf=c=>c.name+'|'+c.code;
-function mkCity(p){return Object.assign({acs:null,wx:null,aq:null,counts:{},countSrc:{},countsFrom:null,countsBaseT:0,countsLiveT:0,liveCats:new Set(),raw:{},scores:{},composite:null,geom:{},geomState:{},popHint:p.population||null},p)}
+function mkCity(p){return Object.assign({acs:null,wx:null,aq:null,counts:{},countSrc:{},countsFrom:null,countsBaseT:0,countsLiveT:0,liveCats:new Set(),raw:{},scores:{},composite:null,geom:{},geomState:{},geomFrom:{},popHint:p.population||null},p)}
 PRESETS.forEach(p=>{const c=mkCity(p);c.wageDef=p.wage||WAGES[p.code];cities.set(keyOf(c),c)});
 /* ================= THE STORE =================
    Single reactive source of truth. All application state lives in S
@@ -544,6 +544,26 @@ function seedCity(city){
     }
   }
   if(from){city.countsFrom=from;city.countsBaseT=asOf;computeRaw(city)}
+}
+function seedGeom(city){
+  // the hex layer gets the same never-blank floor as the counts: the page
+  // ships a dated bundle of mapped site points for the reference cities
+  // (data-geometry.js, loaded async so it never blocks first paint), so
+  // hexes render colored at first open instead of waiting minutes on a
+  // throttled live query. Points saved on this device from a live fetch
+  // are fresher and win over the bundle.
+  const G=window.ABUNDANCE_GEOM;if(!G)return;
+  const entry=G[keyOf(city)];if(!entry)return;
+  CATS.forEach(c=>{
+    if(city.geom[c.id])return;
+    const cached=cacheGet('geom',keyOf(city)+':'+c.id);
+    if(cached&&cached.length){city.geom[c.id]=cached;city.geomState[c.id]='ok';city.geomFrom[c.id]='saved';return}
+    const arr=entry[c.id];
+    if(arr&&arr.length){
+      city.geom[c.id]=arr.map(a=>({lon:a[0],lat:a[1],name:a[2]||null,kind:a[3]||''}));
+      city.geomState[c.id]='ok';city.geomFrom[c.id]='snapshot';
+    }
+  });
 }
 function countsFresh(city){
   const base=city.countsFrom==='snapshot'?('SNAPSHOT '+fmtDT(city.countsBaseT)):city.countsFrom==='saved'?('SAVED '+fmtDT(city.countsBaseT)):null;
@@ -969,6 +989,12 @@ async function loadCityData(city){
     // the dated figures in place if the services answer
     city._openRefreshed=true;
     refreshCounts(city).then(any=>{if(any)commit()}).catch(()=>{});
+    // same courtesy for hex points that came from the shipped bundle:
+    // one live fetch in the background replaces them if it lands
+    const hcat=CATS.find(c=>c.id===S.hexCat);
+    if(hcat&&city.geomFrom[hcat.id]==='snapshot'){
+      fetchGeom(city,hcat).then(g=>{if(g&&g.length&&S.current===city){city.geom[hcat.id]=g;city.geomFrom[hcat.id]='live';commit()}}).catch(()=>{});
+    }
   }
 }
 async function selectCity(city,opts){
@@ -1177,6 +1203,11 @@ document.addEventListener('keydown',e=>{
   // the never-blank floor: every preset city starts from the bundled dated
   // snapshot (or fresher figures saved on this device) and renders at once
   PRESETS.forEach(p=>seedCity(cities.get(keyOf(p))));
+  // the geometry bundle loads without blocking first paint; when it lands,
+  // the reference cities' hex points seed from it and the views repaint
+  const gscr=document.createElement('script');gscr.src='data-geometry.js';
+  gscr.onload=()=>{PRESETS.forEach(p=>seedGeom(cities.get(keyOf(p))));commit()};
+  document.head.appendChild(gscr);
   $('drefresh').addEventListener('click',async()=>{
     const city=S.current;if(!city)return;
     toast('Refreshing '+city.name+' counts live...',2000);
@@ -1263,6 +1294,36 @@ document.addEventListener('keydown',e=>{
   }
   commit();
 })();
+/* ================= geometry harvest (maintenance mode) =================
+   Open the page with ?harvest=1 in a browser whose network reaches the
+   mapping service: it fetches every reference city's site points through
+   the app's own polite machinery, then downloads data-geometry.js, the
+   bundle seedGeom() seeds from. This exists because the build machine's
+   network cannot reach the service at all, while a browser can. */
+if(new URLSearchParams(location.search).has('harvest')){
+  (async()=>{
+    const pre=document.createElement('pre');
+    pre.id='harvestout';
+    pre.style.cssText='position:fixed;inset:8px;z-index:999;background:#0a0e13;color:#cfe3ee;padding:12px;overflow:auto;font:11px/1.5 monospace;white-space:pre-wrap';
+    document.body.appendChild(pre);
+    const log=s=>{pre.textContent+=s+'\n'};
+    const G={};let total=0,done=0,failed=[];
+    for(const p of PRESETS){
+      const city=cities.get(keyOf(p));G[keyOf(p)]={};
+      for(const cat of CATS){
+        try{
+          const pts=await fetchGeom(city,cat);
+          G[keyOf(p)][cat.id]=pts.map(pt=>[Math.round(pt.lon*1e5)/1e5,Math.round(pt.lat*1e5)/1e5,pt.name||'',pt.kind||'']);
+          total+=pts.length;done++;
+          log('OK   '+p.name+' / '+cat.id+': '+pts.length);
+        }catch(e){failed.push(p.name+'/'+cat.id);log('FAIL '+p.name+' / '+cat.id)}
+      }
+    }
+    const blob=new Blob(['window.ABUNDANCE_GEOM='+JSON.stringify(G)+';\n'],{type:'text/javascript'});
+    const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='data-geometry.js';a.click();
+    log('HARVEST DONE total points '+total+' · categories ok '+done+' / '+(PRESETS.length*CATS.length)+(failed.length?' · failed: '+failed.join(', '):''));
+  })();
+}
 </script>
 </body>
 </html>
