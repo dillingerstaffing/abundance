@@ -368,7 +368,7 @@ async function fetchCounts(city){
   const out={};
   CATS.forEach(c=>{if(city.counts&&city.counts[c.id]!=null)out[c.id]=city.counts[c.id]});
   const one=async cat=>{
-    const d=await fetchJSON(ohsomeURL(city,cat,false),20000);out[cat.id]=d.result[0].value;city.countSrc[cat.id]='ohsome';
+    const d=await fetchJSON(ohsomeURL(city,cat,false),12000);out[cat.id]=d.result[0].value;city.countSrc[cat.id]='ohsome';
   };
   const want=()=>CATS.filter(c=>out[c.id]==null);
   await Promise.all(want().map(async cat=>{try{await one(cat)}catch(e){}}));
@@ -395,20 +395,21 @@ const OVERPASS_Q={
   health:['["amenity"~"^(hospital|clinic|pharmacy|doctors|dentist)$"]'],
   air:['["leisure"~"^(park|nature_reserve)$"]']
 };
-async function overpassQuery(ql,timeoutMs){
+async function overpassQuery(ql,timeoutMs,prio){
   // Overpass instances allow about two concurrent heavy queries per IP; a burst
   // of parallel calls queues, times out, and retries the next endpoint, which is
-  // how the hex data starved. Run at most two at a time; the rest wait their turn.
-  await ovpAcquire();
+  // how the hex data starved. Run at most two at a time, and let the open city's
+  // requests jump the queue: background cities wait, the city on screen does not.
+  await ovpAcquire(prio);
   try{return await overpassQueryRaw(ql,timeoutMs)}finally{ovpRelease()}
 }
-let _ovpActive=0;const _ovpWaiters=[];
-function ovpAcquire(){
+let _ovpActive=0;const _ovpQ=[],_ovpQP=[];
+function ovpAcquire(prio){
   if(_ovpActive<2){_ovpActive++;return Promise.resolve()}
-  return new Promise(res=>_ovpWaiters.push(res));
+  return new Promise(res=>{if(prio)_ovpQP.push(res);else _ovpQ.push(res)});
 }
 function ovpRelease(){
-  const next=_ovpWaiters.shift();
+  const next=_ovpQP.shift()||_ovpQ.shift();
   if(next)next();else _ovpActive--;
 }
 async function overpassQueryRaw(ql,timeoutMs){
@@ -428,7 +429,7 @@ async function overpassQueryRaw(ql,timeoutMs){
 async function overpassCount(city,cat){
   const b=boxFor(city);const bbox=b.s+','+b.w+','+b.n+','+b.e;
   const parts=OVERPASS_Q[cat.id].map(t=>'nwr'+t+'('+bbox+');').join('');
-  const d=await overpassQuery('[out:json][timeout:35];('+parts+');out count;',15000);
+  const d=await overpassQuery('[out:json][timeout:35];('+parts+');out count;',15000,S.current&&keyOf(S.current)===keyOf(city));
   const el=(d.elements||[]).find(e=>e.type==='count');
   if(!el||!el.tags||el.tags.total==null)throw new Error('no count in overpass reply');
   return parseInt(el.tags.total,10);
@@ -436,7 +437,7 @@ async function overpassCount(city,cat){
 async function fetchGeom(city,cat){
   const b=boxFor(city);const bbox=b.s+','+b.w+','+b.n+','+b.e;
   const parts=OVERPASS_Q[cat.id].map(t=>'nwr'+t+'('+bbox+');').join('');
-  const d=await overpassQuery('[out:json][timeout:35];('+parts+');out center 900;');
+  const d=await overpassQuery('[out:json][timeout:35];('+parts+');out center 900;',undefined,S.current&&keyOf(S.current)===keyOf(city));
   const pts=[];
   (d.elements||[]).forEach(el=>{
     const lat=el.lat!=null?el.lat:(el.center?el.center.lat:null);
@@ -708,7 +709,9 @@ async function selectCity(city,opts){
   renderDossier(city);
   if(opts.fly&&map){S.flying=true;const off=window.innerWidth<=760?[0,-Math.round(window.innerHeight*0.22)]:[0,0];map.flyTo({center:[city.lon,city.lat],zoom:11.3,speed:0.85,curve:1.4,offset:off});map.once('moveend',()=>{S.flying=false})}
   toast('Loading '+city.name+': Census, live weather, air, OSM counts');
-  await loadCityData(city);
+  const lp=loadCityData(city);
+  drawHexes(); // the grid and its geometry do not wait on the counts phase
+  await lp;
   if(S.current!==city)return;
   renderDossier(city);drawHexes();
   const missingC=!city.acs||CATS.some(c=>!city.counts||city.counts[c.id]==null);
@@ -902,12 +905,17 @@ document.addEventListener('keydown',e=>{
   buildRanges();renderNation();
   // home city first: its counts land and it opens before the rest stream in
   const home=cities.get(keyOf(PRESETS[0]));
+  let homeReady=Promise.resolve();
   if(home){
     // open the home city immediately on its Census/weather/air data; its counts
     // stream in behind the open dossier via loadCityData instead of gating it
     buildRanges();
-    selectCity(home,{fly:true});
+    homeReady=selectCity(home,{fly:true});
   }
+  // the background board waits until the home city has had the data services to
+  // itself (or 30s, whichever comes first): firing all 15 cities' counts at
+  // once throttles the shared services and starves the city on screen
+  await Promise.race([homeReady,new Promise(r=>setTimeout(r,30000))]);
   // slow pass for the remaining cities, two at a time; scores re-normalize as they land
   const queue=PRESETS.slice(1);
   await Promise.all([0,1].map(async()=>{
