@@ -323,6 +323,59 @@ const cities=new Map(); // key: name+code -> city object
 const keyOf=c=>c.name+'|'+c.code;
 function mkCity(p){return Object.assign({acs:null,wx:null,aq:null,counts:{},countSrc:{},countsFrom:null,countsBaseT:0,countsLiveT:0,liveCats:new Set(),raw:{},scores:{},composite:null,geom:{},geomState:{},popHint:p.population||null},p)}
 PRESETS.forEach(p=>{const c=mkCity(p);c.wageDef=p.wage||WAGES[p.code];cities.set(keyOf(c),c)});
+/* ================= THE STORE =================
+   Single reactive source of truth. All application state lives in S
+   (navigation and view state) and the cities map (per-city data).
+   - Fetchers and event handlers only WRITE state, then call commit().
+     They never touch the DOM and never call a render function.
+   - commit() batches: any number of writes within a frame produce ONE
+     render() pass, and render() is the only place data meets the DOM.
+   - render() first derives everything derived (raw values, ranges,
+     scores, composites) from source state in one place, then paints
+     every view from that same state: pins, panel, crumbs, hex field.
+     Two views can therefore never describe different states, which is
+     the bug class that let the hex map and its panel diverge.
+   - The MapLibre surface is the one carve-out: drawHexes() paints it
+     from store state, invoked by render() when the hex inputs change,
+     and directly by MapLibre's own events (style.load) and the hex
+     panel's retry button, which must force a refetch on unchanged state.
+   - Pure chrome (the method overlay, the sheet expansion, the clock)
+     is view-local: it derives from no data and cannot diverge from it. */
+let _commitQueued=false;
+function commit(){
+  if(_commitQueued)return;_commitQueued=true;
+  requestAnimationFrame(()=>{_commitQueued=false;render()});
+}
+function render(){
+  deriveScores();
+  cities.forEach(c=>updatePin(c));
+  document.querySelectorAll('.lens').forEach(b=>b.classList.toggle('on',b.dataset.id===S.lens));
+  setCrumbs();
+  const db=$('dbody');
+  const pk=S.drill+'|'+(S.current?keyOf(S.current):'');
+  const st=(db&&pk===S._panelKey)?db.scrollTop:null;
+  if(S.drill===0)renderNation();
+  else if(S.current)renderDossier(S.current);
+  if(db)db.scrollTop=(pk===S._panelKey&&st!=null)?st:0;
+  S._panelKey=pk;
+  $('hexpanel').style.display=S.drill===2?'block':'none';
+  if(map){
+    if(S.drill===0){
+      if(S.hexData){S.hexData=null;const src=map.getSource('hexes');if(src)src.setData({type:'FeatureCollection',features:[]})}
+    }else if(S.current){
+      const catId=S.lens==='overview'?'food':S.lens;
+      const c=S.current;
+      const sig=keyOf(c)+'|'+catId+'|'+(S._hexNonce||0)+'|'+(c.geomState[catId]||'-')+'|'+(c.geom[catId]?c.geom[catId].length:-1)+'|'+(c.acs?c.acs.pop:0);
+      if(sig!==S._hexSig){S._hexSig=sig;drawHexes()}
+      if(map.getLayer('hexsel'))map.setFilter('hexsel',['==',['get','id'],S.selHex==null?-1:S.selHex]);
+    }
+  }
+  if(S.drill===2)fillHexPanel();
+  if(S.drill===0){
+    const l=LENSES.find(x=>x.id===S.lens);
+    $('leg-label').textContent=S.lens==='overview'?'ABUNDANCE':(l?l.name.toUpperCase()+' PER HEX':'ABUNDANCE');
+  }
+}
 /* ================= helpers ================= */
 const fmt$=n=>n==null||isNaN(n)?'--':'$'+Math.round(n).toLocaleString('en-US');
 const fmtN=n=>n==null||isNaN(n)?'--':Math.round(n).toLocaleString('en-US');
@@ -627,8 +680,13 @@ function computeRaw(city){
     aqi:city.aq?city.aq.aqi:null
   };
 }
-function buildRanges(){
-  const list=PRESETS.map(p=>cities.get(keyOf(p))).filter(c=>c.raw&&c.raw.housing!=null);
+function deriveScores(){
+  // the one derivation pass, called only by render(): raw values for
+  // every city from source state, then the reference field's ranges,
+  // then every city's scores. A score is therefore never computed
+  // against a half-updated field.
+  cities.forEach(c=>computeRaw(c));
+  const list=PRESETS.map(p=>cities.get(keyOf(p))).filter(c=>c&&c.raw&&c.raw.housing!=null);
   if(list.length<3)return;
   const r={};let fieldN=Infinity;
   ['housing','food','energy','transport','health','parks'].forEach(k=>{
@@ -640,8 +698,8 @@ function buildRanges(){
   // the ranks are provisional midpoints that collapse as the field fills, so
   // no score is shown until at least 8 cities report in every category
   S.fieldN=fieldN===Infinity?0:fieldN;
-  S.ranges=r;list.forEach(scoreCity);PRESETS.forEach(p=>{const c=cities.get(keyOf(p));if(c)updatePin(c)});
-  if(S.current){const db=$('dbody');const st=db?db.scrollTop:0;scoreCity(S.current);renderDossier(S.current);if(db)db.scrollTop=st}
+  S.ranges=r;
+  cities.forEach(c=>scoreCity(c));
 }
 const LOGK={food:1,energy:1,transport:1,health:1,parks:1};
 function norm(k,v){
@@ -733,6 +791,7 @@ function addHexLayers(){
   }
 }
 async function drawHexes(){
+  if(!map)return;
   const city=S.current;if(!city||S.drill<1)return;
   const catId=S.lens==='overview'?'food':S.lens;
   const cat=CATS.find(c=>c.id===catId);if(!cat)return;
@@ -820,7 +879,7 @@ function renderDossier(city){
       '<div class="bar"><i style="width:'+(sc==null?0:sc)+'%;background:'+cat.color+'"></i></div>'+
       '<div class="vals">'+catVals(city,cat)+'</div><div class="src">'+cat.src+(state==='ok'&&city.countSrc&&city.countSrc[cat.id]==='overpass'?' · via Overpass fallback':'')+prov+(state==='loading'?' · loading':state==='fail'?' · unavailable, tap row to retry':'')+'</div>';
     div.addEventListener('click',()=>{
-      if(state==='fail'){toast('Retrying '+cat.name+' counts...');loadCityData(city).then(()=>{if(S.current===city)renderDossier(city)})}
+      if(state==='fail'){toast('Retrying '+cat.name+' counts...');loadCityData(city).then(()=>commit())}
       else setLens(cat.id);
     });
     rows.appendChild(div);
@@ -867,35 +926,31 @@ async function loadCityData(city){
   // phase 1: Census, weather and air land first and render, so a slow or dead
   // counts service can never hold the whole dossier hostage
   await Promise.allSettled(jobs);
-  computeRaw(city);scoreCity(city);updatePin(city);
-  if(S.current===city)renderDossier(city);
+  commit();
   // phase 2: counts, with their own retries and fallback source
   if(needCounts){
     try{city.counts=await fetchCounts(city)}catch(e){}
-    computeRaw(city);scoreCity(city);updatePin(city);
-    if(S.current===city)renderDossier(city);
+    commit();
   }else if(city.liveCats.size<CATS.length&&!city._openRefreshed){
     // the city already renders (snapshot or saved figures); opening it asks
     // once for the latest live counts in the background, and they replace
     // the dated figures in place if the services answer
     city._openRefreshed=true;
-    refreshCounts(city).then(any=>{if(any){computeRaw(city);buildRanges();updatePin(city);if(S.current===city)renderDossier(city)}}).catch(()=>{});
+    refreshCounts(city).then(any=>{if(any)commit()}).catch(()=>{});
   }
 }
 async function selectCity(city,opts){
   opts=opts||{};
-  S.current=city;S.drill=1;S.selHex=null;$('hexpanel').style.display='none';
+  S.current=city;S.drill=1;S.selHex=null;
+  S._hexNonce=(S._hexNonce||0)+1; // a fresh open re-asks the hex layer, so failed site data retries
   S.wageDefault=city.wageDef||WAGES[city.code]||7.25;S.wage=S.wageDefault;
   const w=$('wage');w.value=S.wage;
-  setCrumbs();PRESETS.forEach(p=>updatePin(cities.get(keyOf(p))));
-  renderDossier(city);
+  commit();
   if(opts.fly&&map){S.flying=true;const off=window.innerWidth<=760?[0,-Math.round(window.innerHeight*0.22)]:[0,0];map.flyTo({center:[city.lon,city.lat],zoom:11.3,speed:0.85,curve:1.4,offset:off});map.once('moveend',()=>{S.flying=false})}
   toast('Loading '+city.name+': Census, live weather, air, OSM counts');
-  const lp=loadCityData(city);
-  drawHexes(); // the grid and its geometry do not wait on the counts phase
-  await lp;
+  await loadCityData(city);
   if(S.current!==city)return;
-  renderDossier(city);drawHexes();
+  commit();
   const missingC=!city.acs||CATS.some(c=>!city.counts||city.counts[c.id]==null);
   toast(missingC?city.name+' open, some counts unavailable. Tap a marked row to retry.':city.name+' ready',missingC?4200:1400);
   if(missingC)scheduleCountsRetry(city);
@@ -912,8 +967,7 @@ function scheduleCountsRetry(city){
     if(!CATS.some(c=>!city.counts||city.counts[c.id]==null)){city._retryN=null;return}
     if(S.current===city&&S.drill>=1){
       try{city.counts=await fetchCounts(city)}catch(e){}
-      computeRaw(city);buildRanges();updatePin(city);
-      if(S.current===city)renderDossier(city);
+      commit();
       if(!CATS.some(c=>!city.counts||city.counts[c.id]==null)){
         toast(city.name+' ready',1400);city._retryN=null;return;
       }
@@ -927,25 +981,18 @@ function scheduleCountsRetry(city){
   city._retryT=setTimeout(step,60000);
 }
 function goNation(){
-  S.drill=0;S.current=null;S.selHex=null;$('hexpanel').style.display='none';
-  const src=map&&map.getSource('hexes');if(src)src.setData({type:'FeatureCollection',features:[]});
-  setCrumbs();renderNation();
+  S.drill=0;S.current=null;S.selHex=null;
+  commit();
   if(map){S.flying=true;map.flyTo({center:[-96,38.5],zoom:3.6,speed:0.85});map.once('moveend',()=>{S.flying=false})}
-  PRESETS.forEach(p=>updatePin(cities.get(keyOf(p))));
 }
 function digUp(){
-  if(S.drill===2){S.drill=1;S.selHex=null;$('hexpanel').style.display='none';if(map.getLayer('hexsel'))map.setFilter('hexsel',['==',['get','id'],-1]);setCrumbs()}
+  if(S.drill===2){S.drill=1;S.selHex=null;commit()}
   else if(S.drill===1)goNation();
 }
 function selectHex(id){
   if(!S.hexData)return;
   const f=S.hexData.features.find(x=>x.properties.id===id);if(!f)return;
-  S.drill=2;S.selHex=id;setCrumbs();
-  if(map.getLayer('hexsel'))map.setFilter('hexsel',['==',['get','id'],id]);
-  $('hexpanel').style.display='block';
-  fillHexPanel();
-  // the panel lives at the top of the dossier scroll area; bring it into view
-  $('dbody').scrollTop=0;
+  S.drill=2;S.selHex=id;commit();
 }
 function fillHexPanel(){
   if(S.selHex==null||!S.hexData)return;
@@ -995,12 +1042,7 @@ function buildRail(){
 }
 function setLens(id){
   S.lens=id;
-  document.querySelectorAll('.lens').forEach(b=>b.classList.toggle('on',b.dataset.id===id));
-  const l=LENSES.find(x=>x.id===id);
-  $('leg-label').textContent=id==='overview'?'ABUNDANCE':l.name.toUpperCase()+' PER HEX';
-  PRESETS.forEach(p=>updatePin(cities.get(keyOf(p))));
-  if(S.current)renderDossier(S.current);
-  if(S.drill>=1)drawHexes();
+  commit();
 }
 function tickClock(){
   let d;
@@ -1053,7 +1095,7 @@ document.addEventListener('click',e=>{if(!$('searchwrap').contains(e.target))$('
 const sheetToggle=()=>{const exp=$('dossier').classList.toggle('exp');document.body.classList.toggle('exp',exp);$('sheetbtn').textContent=exp?'COLLAPSE':'EXPAND'};
 $('sheetbtn').addEventListener('click',e=>{e.stopPropagation();sheetToggle()});
 $('sheetgrip').addEventListener('click',sheetToggle);
-$('wage').addEventListener('input',e=>{S.wage=parseFloat(e.target.value);updatePaycheck()});
+$('wage').addEventListener('input',e=>{S.wage=parseFloat(e.target.value);commit()});
 $('digup').addEventListener('click',digUp);
 $('hexup').addEventListener('click',digUp);
 $('crumb0').addEventListener('click',()=>{if(S.drill>0)goNation()});
@@ -1086,11 +1128,10 @@ document.addEventListener('keydown',e=>{
     const city=S.current;if(!city)return;
     toast('Refreshing '+city.name+' counts live...',2000);
     const any=await refreshCounts(city).catch(()=>false);
-    computeRaw(city);buildRanges();updatePin(city);
-    if(S.current===city)renderDossier(city);
+    commit();
     toast(any?(city.liveCats.size>=CATS.length?city.name+' counts are live now':'Some counts refreshed live; the rest still show the dated figures'):'Live refresh did not get through. The dated figures below still stand.',3800);
   });
-  buildRail();setCrumbs();renderNation();setInterval(tickClock,1000);tickClock();
+  buildRail();commit();setInterval(tickClock,1000);tickClock();
   try{initMap()}catch(e){toast('Map library failed to load. Check connection and reload.',6000)}
   loadBLS();
   // fast pass: ACS + weather + air for all reference cities
@@ -1101,16 +1142,15 @@ document.addEventListener('keydown',e=>{
       fetchWX(c).then(w=>{c.wx=w;c._wxT=Date.now()}).catch(()=>{}),
       fetchAQ(c).then(a=>{c.aq=a;c._aqT=Date.now()}).catch(()=>{})
     ]);
-    computeRaw(c);
+    commit();
   }));
-  buildRanges();renderNation();
+  commit();
   // home city first: its counts land and it opens before the rest stream in
   const home=cities.get(keyOf(PRESETS[0]));
   let homeReady=Promise.resolve();
   if(home){
     // open the home city immediately on its Census/weather/air data; its counts
     // stream in behind the open dossier via loadCityData instead of gating it
-    buildRanges();
     homeReady=selectCity(home,{fly:true});
   }
   // the background board waits until the home city has had the data services to
@@ -1124,12 +1164,12 @@ document.addEventListener('keydown',e=>{
       const p=queue.shift();const c=cities.get(keyOf(p));
       if(CATS.some(k=>c.counts[k.id]==null)){try{c.counts=await fetchCounts(c)}catch(e){}}
       else if(c.liveCats.size<CATS.length){await refreshCounts(c).catch(()=>{})}
-      computeRaw(c);buildRanges();updatePin(c);if(S.drill===0)renderNation();
+      commit();
       await new Promise(r=>setTimeout(r,600)); // pace the board's requests
     }
   }));
   // the home city renders from its snapshot like the rest; refresh it live too
-  if(home&&home.liveCats.size<CATS.length){await refreshCounts(home).catch(()=>{});computeRaw(home);buildRanges();updatePin(home);if(S.current===home)renderDossier(home)}
+  if(home&&home.liveCats.size<CATS.length){await refreshCounts(home).catch(()=>{});commit()}
   // recovery sweep: a city whose counts failed both rounds is retried once more,
   // so a throttled burst cannot strand its pin on ".." for the whole session
   const stranded=PRESETS.map(p=>cities.get(keyOf(p))).filter(c=>c&&CATS.some(k=>!c.counts||c.counts[k.id]==null));
@@ -1142,7 +1182,7 @@ document.addEventListener('keydown',e=>{
         c._fbOnce=true;
         try{c.counts=await fetchCounts(c)}catch(e){}
         c._fbOnce=false;
-        computeRaw(c);buildRanges();updatePin(c);if(S.drill===0)renderNation();
+        commit();
       }
     }));
     const still=PRESETS.map(p=>cities.get(keyOf(p))).filter(c=>c&&CATS.some(k=>!c.counts||c.counts[k.id]==null));
@@ -1161,11 +1201,11 @@ document.addEventListener('keydown',e=>{
         c._fbOnce=true;
         try{c.counts=await fetchCounts(c)}catch(e){}
         c._fbOnce=false;
-        computeRaw(c);buildRanges();updatePin(c);if(S.drill===0)renderNation();
+        commit();
       }
     }));
   }
-  buildRanges();if(S.drill===0)renderNation();
+  commit();
 })();
 </script>
 </body>
