@@ -362,7 +362,7 @@ function ohsomeURL(city,cat,geom){
 async function fetchCounts(city){
   const out={};
   const one=async cat=>{
-    const d=await fetchJSON(ohsomeURL(city,cat,false),30000);out[cat.id]=d.result[0].value;
+    const d=await fetchJSON(ohsomeURL(city,cat,false),20000);out[cat.id]=d.result[0].value;
   };
   await Promise.all(CATS.map(async cat=>{try{await one(cat)}catch(e){out[cat.id]=null}}));
   // one delayed retry for whatever failed, so a throttled burst does not strand a category
@@ -843,6 +843,22 @@ document.addEventListener('keydown',e=>{
       computeRaw(c);buildRanges();updatePin(c);if(S.drill===0)renderNation();
     }
   }));
+  // recovery sweep: a city whose counts failed both rounds is retried once more,
+  // so a throttled burst cannot strand its pin on ".." for the whole session
+  const stranded=PRESETS.map(p=>cities.get(keyOf(p))).filter(c=>c&&CATS.some(k=>!c.counts||c.counts[k.id]==null));
+  if(stranded.length){
+    await new Promise(r=>setTimeout(r,3000));
+    const q2=stranded.slice();
+    await Promise.all([0,1].map(async()=>{
+      while(q2.length){
+        const c=q2.shift();
+        try{c.counts=await fetchCounts(c)}catch(e){}
+        computeRaw(c);buildRanges();updatePin(c);if(S.drill===0)renderNation();
+      }
+    }));
+    const still=PRESETS.map(p=>cities.get(keyOf(p))).filter(c=>c&&CATS.some(k=>!c.counts||c.counts[k.id]==null));
+    if(still.length)toast('Some reference cities could not finish loading counts. Tap a city pin to retry it.',7000);
+  }
   buildRanges();if(S.drill===0)renderNation();
 })();
 </script>
