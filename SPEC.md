@@ -69,3 +69,18 @@ Dark cartography first (CARTO dark matter), hairline 1px borders, 2 to 3px
 radii, JetBrains Mono for numerals and labels, no glow, no pill chrome, dense
 tabular rows. Camera moves are flights, never jumps. Live values pulse once on
 update, then hold still.
+
+## Addendum, Nov 16 2026: phone layout and data states (after Chris's iOS report)
+
+Chris opened the live site on iOS and found the phone layout broken: headline yields invisible, category rows unreachable, hex cells apparently empty. A phone-viewport audit (390x844 and 375x667, Chromium and WebKit engines, touch input, all APIs served from captured real payloads) measured the causes and the fixes:
+
+- HUD: on phones the single flex row crushed the yields strip to 0px wide (693px of content in a 0px slot). The HUD now wraps to two rows on narrow screens: brand/search/buttons, then the yields strip at full width, internally scrollable, every yield reachable.
+- Dossier: the bottom sheet used max-height:44% with four pinned chrome blocks; on a 667px phone the scrollable body measured 0px tall, so categories, BLS strip and hex panel rendered into a zero-height box. The sheet now has a definite height (52vh, then 52dvh as the enhanced declaration), the sources footer scrolls with the body instead of pinning, score descriptions hide on phones, and a grip + EXPAND button grows the sheet to calc(100dvh - 156px), stopping below the drill bar.
+- Lens rail: it was positioned over the sheet and intercepted its touches. It now docks directly above the collapsed sheet (bottom: calc(52dvh + 14px)) and fades out while the sheet is expanded (category rows inside the sheet switch lenses). The hex legend, previously display:none on phones, rides above the rail in compact form.
+- Drill bar: it wrapped to two rows and overflowed the right edge. It is now a single non-wrapping internally scrollable strip; the L1 crumb drops the city name on narrow screens.
+- Camera: flying to a city on a phone centered it under the sheet. flyTo now takes a -22% viewport-height offset on narrow screens so the city and its densest hexes land in the visible map area.
+- Data states (the "missing data" half of the report): loading, loaded and failed were indistinguishable (all showed "--"), and a failed Overpass fetch was cached as an empty result for the whole session. Now every category row states loading vs unavailable, a failed row retries its fetch on tap, hex geometry tracks loading/ok/fail per city and category, failures are never cached, the hex panel shows the state explicitly with a RETRY button, and a panel left open refreshes itself when its data lands. Hex panel content also gained context: cell count against the city total, named sites listed individually, unnamed sites grouped by kind with counts, and a truncation note at the Overpass 900-element cap.
+- Boot order: Ocean City's counts now load and the city opens before the other 14 cities stream in, instead of after the whole board.
+- Overpass endpoints: a third mirror (overpass.nchc.org.tw) added after overpass-api.de and kumi.
+
+Verification: the audit battery (no horizontal overflow, yields reachable, no rail/sheet overlap, touch-swipe scrolls the dossier, footer reachable at scroll bottom, hex tap opens a populated panel, sheet expands/collapses, method modal scrolls and closes, zero console errors) passes at both phone sizes in Chromium and WebKit, plus Overpass failure and 15-second-delay modes for the state UI, plus a desktop regression pass. One emulator caveat: the software-rendered WebKit in the test VM intermittently takes >15s to make hex features hit-testable; on GPU hardware this does not occur, and the same engine passed the tap test in other runs.

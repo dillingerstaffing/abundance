@@ -25,12 +25,13 @@
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%;overflow:hidden;background:var(--bg)}
 html{overflow-x:clip}
-body{font-family:var(--sans);color:var(--ink);font-size:14px;-webkit-text-size-adjust:100%}
+body{font-family:var(--sans);color:var(--ink);font-size:14px;-webkit-text-size-adjust:100%;position:relative;height:100vh;height:100dvh}
 #map{position:absolute;inset:0}
 #minimap{position:absolute;right:12px;bottom:44px;width:168px;height:110px;border:1px solid var(--line2);border-radius:3px;overflow:hidden;z-index:5;background:#000}
 #minimap .maplibregl-ctrl-attrib{display:none}
 .maplibregl-ctrl-attrib{background:rgba(10,12,14,.72)!important;color:#7c858e!important;font-size:9px!important}
 .maplibregl-ctrl-attrib a{color:#9aa3ab!important}
+.maplibregl-ctrl-top-right{top:72px;right:12px}
 .maplibregl-ctrl-group{background:var(--panel2)!important;border:1px solid var(--line2);border-radius:3px!important;box-shadow:none!important}
 .maplibregl-ctrl-group button{background:transparent!important}
 .maplibregl-ctrl-group button span{filter:invert(.85)}
@@ -92,7 +93,7 @@ button{font-family:var(--mono);cursor:pointer;color:var(--ink);background:none;b
 #wagerow>span:first-child{white-space:nowrap}
 #wagerow input[type=range]{flex:1;accent-color:var(--energy);height:2px;min-width:60px}
 #wageval{color:var(--ink);font-size:12px;min-width:118px;text-align:right;white-space:nowrap}
-#dbody{flex:1;overflow-y:auto;scrollbar-width:thin}
+#dbody{flex:1;min-height:0;overflow-y:auto;scrollbar-width:thin;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
 .catrow{padding:10px 14px 9px;border-bottom:1px solid var(--line);cursor:pointer}
 .catrow:hover{background:#12161b}
 .catrow.hot{box-shadow:inset 2px 0 0 var(--ink)}
@@ -105,6 +106,7 @@ button{font-family:var(--mono);cursor:pointer;color:var(--ink);background:none;b
 .catrow .vals{font-family:var(--mono);font-size:11px;color:var(--dim);line-height:1.55}
 .catrow .vals b{color:var(--ink);font-weight:500}
 .catrow .src{font-size:9px;color:var(--faint);letter-spacing:.06em;text-transform:uppercase;margin-top:3px}
+#sheetgrip{display:none}
 #hexpanel{padding:11px 14px;border-bottom:1px solid var(--line);display:none;background:#10141a}
 #hexpanel .k{font-size:9px;letter-spacing:.13em;color:var(--faint);text-transform:uppercase}
 #hexpanel .t{font-family:var(--mono);font-size:13px;margin:3px 0 6px}
@@ -151,22 +153,50 @@ button{font-family:var(--mono);cursor:pointer;color:var(--ink);background:none;b
 #mclose{float:right;border:1px solid var(--line2);border-radius:3px;padding:5px 11px;font-size:11px}
 
 @media (max-width:760px){
+  /* HUD becomes two rows: brand/search/buttons, then the yields strip at full width */
+  #hud{flex-wrap:wrap}
   #brand{min-width:0;padding:7px 10px 6px}
   #brand .t{font-size:14px}
   #brand .s{display:none}
-  #searchbox{border-right:none;padding:0 6px}
-  #q{width:118px}
-  #qres{width:230px}
+  #searchbox{border-right:none;padding:0 4px}
+  #q{width:104px;font-size:11px;padding:6px 7px}
+  #qres{width:min(280px,calc(100vw - 16px))}
   #clock{display:none}
-  #lensrail{top:auto;bottom:118px;left:8px;right:8px;flex-direction:row;overflow-x:auto;gap:5px;scrollbar-width:none}
-  #lensrail::-webkit-scrollbar{display:none}
-  .lens{flex:none;padding:6px 8px}
-  .lens .key{display:none}
-  #dossier{top:auto;left:8px;right:8px;bottom:8px;width:auto;max-height:44%}
-  #drillbar{bottom:auto;top:60px;left:8px}
-  #minimap,#legend{display:none}
-  .yld{padding:4px 9px}
+  #hudright{margin-left:auto;border-left:none;padding:0 8px;gap:6px}
+  .hbtn{padding:5px 8px;font-size:10px}
+  #yields{order:5;flex:1 1 100%;border-top:1px solid var(--line);min-height:35px}
+  .yld{padding:3px 10px}
   .yld .v{font-size:13px}
+  /* drill bar and toast sit under the two-row HUD, over the map, never over the sheet */
+  #drillbar{bottom:auto;top:92px;left:8px;font-size:10px;padding:5px 6px;flex-wrap:nowrap;max-width:calc(100vw - 16px);overflow-x:auto;scrollbar-width:none}
+  #drillbar::-webkit-scrollbar{display:none}
+  .crumb{padding:3px 6px;white-space:nowrap;flex:none}
+  #digup{padding:3px 7px;font-size:10px;white-space:nowrap;flex:none}
+  #toast{bottom:calc(52vh + 100px);bottom:calc(52dvh + 100px);top:auto;max-width:calc(100vw - 24px);text-align:center}
+  /* lens rail docks directly above the collapsed sheet; the sheet covers it when expanded */
+  #lensrail{top:auto;bottom:calc(52vh + 14px);bottom:calc(52dvh + 14px);left:8px;right:8px;flex-direction:row;overflow-x:auto;gap:5px;scrollbar-width:none;z-index:13}
+  #lensrail::-webkit-scrollbar{display:none}
+  body.exp #lensrail{opacity:0;pointer-events:none}
+  .lens{flex:none;padding:6px 8px;font-size:10px}
+  .lens .key{display:none}
+  /* the sheet: definite height (vh fallback first, then dvh), expandable to near full screen */
+  #dossier{top:auto;left:8px;right:8px;width:auto;height:52vh;height:52dvh;max-height:none;
+    bottom:calc(8px + env(safe-area-inset-bottom,0px));transition:height .25s ease}
+  #dossier.exp{height:calc(100vh - 156px);height:calc(100dvh - 156px)}
+  #sheetgrip{display:flex;align-items:center;gap:10px;padding:7px 14px 5px;border-bottom:1px solid var(--line);cursor:pointer}
+  #sheetgrip .bar{width:38px;height:4px;border-radius:2px;background:var(--line2);margin:0 auto}
+  #sheetbtn{border:1px solid var(--line2);border-radius:3px;padding:4px 9px;font-size:10px;letter-spacing:.08em;background:#10141a;flex:none}
+  #dhead{padding:9px 14px 8px}
+  .scorecell{padding:7px 12px}
+  .scorecell .d{display:none}
+  .scorecell .v{font-size:19px}
+  #wageval{min-width:0;font-size:11px}
+  #minimap{display:none}
+  /* compact legend rides above the lens rail, right side */
+  #legend{display:flex;top:auto;bottom:calc(52vh + 54px);bottom:calc(52dvh + 54px);right:8px;padding:5px 8px;gap:5px}
+  #legend .grad{width:52px}
+  #leg-lo,#leg-hi{display:none}
+  .maplibregl-ctrl-top-right{display:none}
 }
 </style>
 </head>
@@ -199,6 +229,7 @@ button{font-family:var(--mono);cursor:pointer;color:var(--ink);background:none;b
 <div id="lensrail"></div>
 
 <aside id="dossier">
+  <div id="sheetgrip"><span class="bar"></span><button id="sheetbtn">EXPAND</button></div>
   <div id="dhead">
     <div class="city" id="d-city">United States</div>
     <div class="sub" id="d-sub">15 reference cities loaded as pins. Select one, or search any US city, to dig down.</div>
@@ -213,8 +244,8 @@ button{font-family:var(--mono);cursor:pointer;color:var(--ink);background:none;b
       <button id="hexup" class="hbtn" style="margin-top:8px">DIG UP TO CITY</button></div>
     <div id="catrows"></div>
     <div id="blsstrip">National price context (BLS, monthly): loading...</div>
+    <div id="dfoot">Sources: US Census Bureau ACS via Census Reporter; OpenStreetMap via ohsome API (counts) and Overpass API (hex geometry); Open-Meteo weather and air quality; US DOL wage table; BLS CPI. Every figure carries its source. A figure that fails to load shows as unavailable, never estimated. <a href="#" id="footmethod">Full method</a></div>
   </div>
-  <div id="dfoot">Sources: US Census Bureau ACS via Census Reporter; OpenStreetMap via ohsome API (counts) and Overpass API (hex geometry); Open-Meteo weather and air quality; US DOL wage table; BLS CPI. Every figure carries its source. A figure that fails to load shows as unavailable, never estimated. <a href="#" id="footmethod">Full method</a></div>
 </aside>
 
 <div id="drillbar">
@@ -285,7 +316,7 @@ const PRESETS=[
 const S={lens:'overview',drill:0,current:null,wage:15.92,wageDefault:15.92,ranges:null,hexCat:null,hexData:null,selHex:null,flying:false,styleDark:true};
 const cities=new Map(); // key: name+code -> city object
 const keyOf=c=>c.name+'|'+c.code;
-function mkCity(p){return Object.assign({acs:null,wx:null,aq:null,counts:{},raw:{},scores:{},composite:null,geom:{},popHint:p.population||null},p)}
+function mkCity(p){return Object.assign({acs:null,wx:null,aq:null,counts:{},raw:{},scores:{},composite:null,geom:{},geomState:{},popHint:p.population||null},p)}
 PRESETS.forEach(p=>{const c=mkCity(p);c.wageDef=p.wage||WAGES[p.code];cities.set(keyOf(c),c)});
 /* ================= helpers ================= */
 const fmt$=n=>n==null||isNaN(n)?'--':'$'+Math.round(n).toLocaleString('en-US');
@@ -354,7 +385,7 @@ async function fetchGeom(city,cat){
   const b=boxFor(city);const bbox=b.s+','+b.w+','+b.n+','+b.e;
   const parts=OVERPASS_Q[cat.id].map(t=>'nwr'+t+'('+bbox+');').join('');
   const ql='[out:json][timeout:35];('+parts+');out center 900;';
-  const eps=['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter'];
+  const eps=['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter','https://overpass.nchc.org.tw/api/interpreter'];
   let d=null,lastErr=null;
   for(const ep of eps){
     try{
@@ -410,7 +441,7 @@ function buildRanges(){
     if(vs.length)r[k]={min:Math.min.apply(null,vs),max:Math.max.apply(null,vs)};
   });
   S.ranges=r;list.forEach(scoreCity);PRESETS.forEach(p=>{const c=cities.get(keyOf(p));if(c)updatePin(c)});
-  if(S.current)scoreCity(S.current),renderDossier(S.current);
+  if(S.current){const db=$('dbody');const st=db?db.scrollTop:0;scoreCity(S.current);renderDossier(S.current);if(db)db.scrollTop=st}
 }
 const LOGK={food:1,energy:1,transport:1,health:1,parks:1};
 function norm(k,v){
@@ -506,7 +537,10 @@ async function drawHexes(){
   const src0=map.getSource('hexes');if(src0)src0.setData(grid);
   const leg=$('leg-label');if(leg)leg.textContent=cat.name.toUpperCase()+' PER HEX';
   if(!city.geom[catId]){
-    try{city.geom[catId]=await fetchGeom(city,cat)}catch(e){city.geom[catId]=[];toast('Hex data unavailable for '+cat.name)}
+    city.geomState[catId]='loading';
+    if(S.drill===2&&S.selHex!=null)fillHexPanel();
+    try{city.geom[catId]=await fetchGeom(city,cat);city.geomState[catId]='ok'}
+    catch(e){city.geomState[catId]='fail';toast('Hex site data unavailable for '+cat.name+'. Tap a cell to retry.')}
   }
   if(S.current!==city||S.hexCat!==catId)return;
   const pts=city.geom[catId]||[];
@@ -521,6 +555,7 @@ async function drawHexes(){
     if(best&&bd<(grid.R*1.1)*(grid.R*1.1)){best.properties.count++;(best._pts=best._pts||[]).push(p)}
   });
   const src=map.getSource('hexes');if(src)src.setData(grid);
+  if(S.drill===2&&S.selHex!=null)fillHexPanel();
 }
 /* ================= ASSEMBLY 4 + 3: DOSSIER AND DRILL STACK ================= */
 const HOURS=173.33;
@@ -536,13 +571,15 @@ function updatePaycheck(){
 function catVals(city,cat){
   const c=city.counts||{},r=city.raw||{};
   const per=v=>v==null?'--':fmt1(v);
+  const ld=what=>'Loading '+what+' from OpenStreetMap...';
+  const un='OpenStreetMap counts unavailable. Tap this row to retry.';
   switch(cat.id){
-    case 'housing':return city.acs?('Median rent <b>'+fmt$(city.acs.rent)+'</b> · home value <b>'+fmt$(city.acs.home)+'</b> · vacancy <b>'+(city.acs.vacancy==null?'--':fmt1(city.acs.vacancy)+'%')+'</b>'):'Census figures unavailable for this place.';
-    case 'food':return '<b>'+fmtN(c.food)+'</b> supermarkets and markets mapped · <b>'+per(r.food)+'</b> per 10k residents';
-    case 'energy':return '<b>'+fmtN(c.energy)+'</b> chargers and generators mapped · <b>'+per(r.energy)+'</b> per 10k · solar now <b>'+(city.wx?fmtN(city.wx.solar)+' W/m2':'--')+'</b>';
-    case 'transport':return '<b>'+fmtN(c.transport)+'</b> stops and stations mapped · <b>'+per(r.transport)+'</b> per 10k residents';
-    case 'health':return '<b>'+fmtN(c.health)+'</b> hospitals, clinics, pharmacies mapped · <b>'+per(r.health)+'</b> per 10k residents';
-    case 'air':return 'US AQI <b>'+(city.aq?fmtN(city.aq.aqi):'--')+'</b> · PM2.5 <b>'+(city.aq?fmt1(city.aq.pm)+' ug/m3':'--')+'</b> · <b>'+fmtN(c.air)+'</b> parks ('+per(r.parks)+' per 10k)';
+    case 'housing':return city.acs?('Median rent <b>'+fmt$(city.acs.rent)+'</b> · home value <b>'+fmt$(city.acs.home)+'</b> · vacancy <b>'+(city.acs.vacancy==null?'--':fmt1(city.acs.vacancy)+'%')+'</b>'):'Census figures loading, or unavailable for this place.';
+    case 'food':return c.food===undefined?ld('supermarkets and markets'):c.food===null?un:'<b>'+fmtN(c.food)+'</b> supermarkets and markets mapped · <b>'+per(r.food)+'</b> per 10k residents';
+    case 'energy':return c.energy===undefined?ld('chargers and generators'):c.energy===null?un:'<b>'+fmtN(c.energy)+'</b> chargers and generators mapped · <b>'+per(r.energy)+'</b> per 10k · solar now <b>'+(city.wx?fmtN(city.wx.solar)+' W/m2':'--')+'</b>';
+    case 'transport':return c.transport===undefined?ld('stops and stations'):c.transport===null?un:'<b>'+fmtN(c.transport)+'</b> stops and stations mapped · <b>'+per(r.transport)+'</b> per 10k residents';
+    case 'health':return c.health===undefined?ld('hospitals, clinics, pharmacies'):c.health===null?un:'<b>'+fmtN(c.health)+'</b> hospitals, clinics, pharmacies mapped · <b>'+per(r.health)+'</b> per 10k residents';
+    case 'air':return 'US AQI <b>'+(city.aq?fmtN(city.aq.aqi):'--')+'</b> · PM2.5 <b>'+(city.aq?fmt1(city.aq.pm)+' ug/m3':'--')+'</b> · '+(c.air===undefined?ld('parks'):c.air===null?un:'<b>'+fmtN(c.air)+'</b> parks ('+per(r.parks)+' per 10k)');
   }
   return '';
 }
@@ -559,11 +596,16 @@ function renderDossier(city){
   const rows=$('catrows');rows.innerHTML='';
   CATS.forEach(cat=>{
     const sc=city.scores?city.scores[cat.id]:null;
+    const cnt=city.counts?city.counts[cat.id]:undefined;
+    const state=cat.id==='housing'?(city.acs?'ok':'loading'):(cnt===undefined?'loading':(cnt===null?'fail':'ok'));
     const div=document.createElement('div');div.className='catrow'+(S.lens===cat.id?' hot':'');
     div.innerHTML='<div class="r1"><span class="dot" style="background:'+cat.color+'"></span><span class="nm">'+cat.name+'</span><span class="sc num" style="color:'+cat.color+'">'+(sc==null?'--':sc)+'</span></div>'+
       '<div class="bar"><i style="width:'+(sc==null?0:sc)+'%;background:'+cat.color+'"></i></div>'+
-      '<div class="vals">'+catVals(city,cat)+'</div><div class="src">'+cat.src+'</div>';
-    div.addEventListener('click',()=>setLens(cat.id));
+      '<div class="vals">'+catVals(city,cat)+'</div><div class="src">'+cat.src+(state==='loading'?' · loading':state==='fail'?' · unavailable, tap row to retry':'')+'</div>';
+    div.addEventListener('click',()=>{
+      if(state==='fail'){toast('Retrying '+cat.name+' counts...');loadCityData(city).then(()=>{if(S.current===city)renderDossier(city)})}
+      else setLens(cat.id);
+    });
     rows.appendChild(div);
   });
   updatePaycheck();
@@ -593,7 +635,7 @@ function setCrumbs(){
   $('crumb1').classList.toggle('on',S.drill===1);
   $('crumb2').classList.toggle('on',S.drill===2);
   $('digup').disabled=S.drill===0;
-  $('crumb1').textContent='L1 CITY'+(S.current?' · '+S.current.name.toUpperCase():'');
+  $('crumb1').textContent='L1 CITY'+(S.current?(window.innerWidth<=760?'':' · '+S.current.name.toUpperCase()):'');
 }
 async function loadCityData(city){
   const jobs=[];
@@ -611,7 +653,7 @@ async function selectCity(city,opts){
   const w=$('wage');w.value=S.wage;
   setCrumbs();PRESETS.forEach(p=>updatePin(cities.get(keyOf(p))));
   renderDossier(city);
-  if(opts.fly&&map){S.flying=true;map.flyTo({center:[city.lon,city.lat],zoom:11.3,speed:0.85,curve:1.4});map.once('moveend',()=>{S.flying=false})}
+  if(opts.fly&&map){S.flying=true;const off=window.innerWidth<=760?[0,-Math.round(window.innerHeight*0.22)]:[0,0];map.flyTo({center:[city.lon,city.lat],zoom:11.3,speed:0.85,curve:1.4,offset:off});map.once('moveend',()=>{S.flying=false})}
   toast('Loading '+city.name+': Census, live weather, air, OSM counts');
   await loadCityData(city);
   if(S.current!==city)return;
@@ -634,14 +676,46 @@ function selectHex(id){
   const f=S.hexData.features.find(x=>x.properties.id===id);if(!f)return;
   S.drill=2;S.selHex=id;setCrumbs();
   if(map.getLayer('hexsel'))map.setFilter('hexsel',['==',['get','id'],id]);
-  const cat=CATS.find(c=>c.id===S.hexCat);
-  $('hex-title').textContent=(cat?cat.name:'Sites')+' · '+f.properties.count+' mapped site'+(f.properties.count===1?'':'s')+' in this cell';
-  const ul=$('hex-list');ul.innerHTML='';
-  const pts=f._pts||[];
-  if(!pts.length)ul.innerHTML='<li>No mapped sites in this cell for this lens.</li>';
-  pts.slice(0,40).forEach(p=>{const li=document.createElement('li');li.textContent=(p.name||p.kind||'Unnamed site');ul.appendChild(li)});
-  if(pts.length>40){const li=document.createElement('li');li.textContent='+ '+(pts.length-40)+' more';ul.appendChild(li)}
   $('hexpanel').style.display='block';
+  fillHexPanel();
+  // the panel lives at the top of the dossier scroll area; bring it into view
+  $('dbody').scrollTop=0;
+}
+function fillHexPanel(){
+  if(S.selHex==null||!S.hexData)return;
+  const f=S.hexData.features.find(x=>x.properties.id===S.selHex);if(!f)return;
+  const cat=CATS.find(c=>c.id===S.hexCat);
+  const catName=cat?cat.name:'Sites';
+  const city=S.current;
+  const state=city?city.geomState[S.hexCat]:null;
+  const total=city&&city.geom[S.hexCat]?city.geom[S.hexCat].length:null;
+  const ul=$('hex-list');ul.innerHTML='';
+  const addLi=(txt,btn)=>{
+    const li=document.createElement('li');li.textContent=txt;
+    if(btn){const b=document.createElement('button');b.className='hbtn';b.style.marginLeft='8px';b.textContent='RETRY';
+      b.addEventListener('click',()=>drawHexes());li.appendChild(b)}
+    ul.appendChild(li);
+  };
+  if(state==='loading'){
+    $('hex-title').textContent=catName+' · site data loading';
+    addLi('Loading mapped sites from OpenStreetMap (Overpass). The counts in this cell land when it answers.');
+    return;
+  }
+  if(state==='fail'){
+    $('hex-title').textContent=catName+' · site data unavailable';
+    addLi('Overpass did not answer, so this cell cannot be counted yet. Nothing here is estimated.',true);
+    return;
+  }
+  $('hex-title').textContent=catName+' · '+f.properties.count+' mapped site'+(f.properties.count===1?'':'s')+' in this cell'+
+    (total!=null&&city?' · of '+total+' mapped in '+city.name:'')+(total!=null&&total>=900?' (first 900 shown)':'');
+  const pts=f._pts||[];
+  if(!pts.length){addLi('No mapped sites in this cell for this lens.');return}
+  const named=pts.filter(p=>p.name),unnamed=pts.filter(p=>!p.name);
+  named.slice(0,40).forEach(p=>addLi(p.name+(p.kind?' · '+p.kind:'')));
+  const byKind={};
+  unnamed.forEach(p=>{const k=p.kind||'site';byKind[k]=(byKind[k]||0)+1});
+  Object.keys(byKind).sort().forEach(k=>addLi(k+' x '+byKind[k]+' (unnamed in OpenStreetMap)'));
+  if(named.length>40)addLi('+ '+(named.length-40)+' more named sites');
 }
 /* ================= ASSEMBLY 2 + 7: LENSES AND CHROME ================= */
 function buildRail(){
@@ -710,6 +784,9 @@ $('q').addEventListener('input',e=>{
 });
 document.addEventListener('click',e=>{if(!$('searchwrap').contains(e.target))$('qres').style.display='none'});
 /* chrome wiring */
+const sheetToggle=()=>{const exp=$('dossier').classList.toggle('exp');document.body.classList.toggle('exp',exp);$('sheetbtn').textContent=exp?'COLLAPSE':'EXPAND'};
+$('sheetbtn').addEventListener('click',e=>{e.stopPropagation();sheetToggle()});
+$('sheetgrip').addEventListener('click',sheetToggle);
 $('wage').addEventListener('input',e=>{S.wage=parseFloat(e.target.value);updatePaycheck()});
 $('digup').addEventListener('click',digUp);
 $('hexup').addEventListener('click',digUp);
@@ -749,19 +826,24 @@ document.addEventListener('keydown',e=>{
     ]);
     computeRaw(c);
   }));
-  renderNation();
-  // slow pass: OSM counts, three cities at a time, pins fill in as scores land
-  const queue=PRESETS.slice();
+  buildRanges();renderNation();
+  // home city first: its counts land and it opens before the rest stream in
+  const home=cities.get(keyOf(PRESETS[0]));
+  if(home){
+    try{home.counts=await fetchCounts(home)}catch(e){}
+    computeRaw(home);buildRanges();
+    selectCity(home,{fly:true});
+  }
+  // slow pass for the remaining cities, two at a time; scores re-normalize as they land
+  const queue=PRESETS.slice(1);
   await Promise.all([0,1].map(async()=>{
     while(queue.length){
       const p=queue.shift();const c=cities.get(keyOf(p));
       try{c.counts=await fetchCounts(c)}catch(e){}
-      computeRaw(c);scoreCity(c);updatePin(c);if(S.drill===0)renderNation();
+      computeRaw(c);buildRanges();updatePin(c);if(S.drill===0)renderNation();
     }
   }));
-  buildRanges();renderNation();
-  const home=cities.get(keyOf(PRESETS[0]));
-  if(home)selectCity(home,{fly:true});
+  buildRanges();if(S.drill===0)renderNation();
 })();
 </script>
 </body>
