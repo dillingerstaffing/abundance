@@ -133,7 +133,7 @@ button{font-family:var(--mono);cursor:pointer;color:var(--ink);background:none;b
 
 /* ---------- City pins ---------- */
 .pin{width:34px;height:34px;border-radius:3px;background:rgba(10,13,16,.88);border:1px solid var(--line2);
-  display:flex;align-items:center;justify-content:center;cursor:pointer;position:relative}
+  display:flex;align-items:center;justify-content:center;cursor:pointer}
 .pin .n{font-family:var(--mono);font-size:12px;font-weight:700;color:var(--ink)}
 .pin::after{content:'';position:absolute;left:50%;bottom:-5px;width:8px;height:8px;background:inherit;border-right:1px solid var(--line2);border-bottom:1px solid var(--line2);transform:translateX(-50%) rotate(45deg)}
 .pin:hover{border-color:var(--ink)}
@@ -362,23 +362,27 @@ function ohsomeURL(city,cat,geom){
 async function fetchCounts(city){
   if(city._fc)return city._fc;
   city._fc=(async()=>{
+  // merge, never regress: a count already known stays known, and only the
+  // categories still missing are fetched. Replacing the whole counts object
+  // let a later flaky round erase categories an earlier round had landed.
   const out={};
+  CATS.forEach(c=>{if(city.counts&&city.counts[c.id]!=null)out[c.id]=city.counts[c.id]});
   const one=async cat=>{
     const d=await fetchJSON(ohsomeURL(city,cat,false),20000);out[cat.id]=d.result[0].value;city.countSrc[cat.id]='ohsome';
   };
-  await Promise.all(CATS.map(async cat=>{try{await one(cat)}catch(e){out[cat.id]=null}}));
+  const want=()=>CATS.filter(c=>out[c.id]==null);
+  await Promise.all(want().map(async cat=>{try{await one(cat)}catch(e){}}));
   // one delayed retry for whatever failed, so a throttled burst does not strand a category
-  let missing=CATS.filter(c=>out[c.id]==null);
-  if(missing.length){
+  if(want().length){
     await new Promise(r=>setTimeout(r,2500));
-    await Promise.all(missing.map(async cat=>{try{await one(cat)}catch(e){}}));
+    await Promise.all(want().map(async cat=>{try{await one(cat)}catch(e){}}));
   }
   // second source: if ohsome is down, count the same OpenStreetMap data via Overpass,
   // in parallel, so an ohsome outage degrades the load instead of gutting the dossier
-  missing=CATS.filter(c=>out[c.id]==null);
-  await Promise.all(missing.map(async cat=>{
+  await Promise.all(want().map(async cat=>{
     try{out[cat.id]=await overpassCount(city,cat);city.countSrc[cat.id]='overpass'}catch(e){}
   }));
+  CATS.forEach(c=>{if(out[c.id]==null)out[c.id]=(city.counts&&city.counts[c.id]!=null)?city.counts[c.id]:null});
   return out;
   })();
   try{return await city._fc}finally{city._fc=null}
