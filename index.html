@@ -576,6 +576,15 @@ async function overpassCounts(city,cats){
   return out;
 }
 async function fetchGeom(city,cat){
+  // one network fetch per city and category at a time: overlapping draws
+  // share the same promise instead of racing separate requests
+  city._fg=city._fg||{};
+  if(city._fg[cat.id])return city._fg[cat.id];
+  const p=fetchGeomRaw(city,cat);
+  city._fg[cat.id]=p;
+  try{return await p}finally{delete city._fg[cat.id]}
+}
+async function fetchGeomRaw(city,cat){
   const ck=keyOf(city)+':'+cat.id;
   const hitGeom=cacheGet('geom',ck);if(hitGeom)return hitGeom;
   const b=boxFor(city);const bbox=b.s+','+b.w+','+b.n+','+b.e;
@@ -728,6 +737,11 @@ async function drawHexes(){
   const catId=S.lens==='overview'?'food':S.lens;
   const cat=CATS.find(c=>c.id===catId);if(!cat)return;
   S.hexCat=catId;
+  // generation guard: overlapping draws (selectCity fires two, a lens change
+  // a third) must not let an older draw's late geometry overwrite the grid
+  // the panel reads, or the map and the panel end up describing different
+  // cells and a filled cell reports zero sites
+  const gen=(city._hexGen=(city._hexGen||0)+1);
   // the field itself renders at once; counts land when the geometry arrives
   const grid=buildHexes(city);S.hexData=grid;
   const src0=map.getSource('hexes');if(src0)src0.setData(grid);
@@ -738,7 +752,7 @@ async function drawHexes(){
     try{city.geom[catId]=await fetchGeom(city,cat);city.geomState[catId]='ok'}
     catch(e){city.geomState[catId]='fail';toast('Hex site data unavailable for '+cat.name+'. Tap a cell to retry.')}
   }
-  if(S.current!==city||S.hexCat!==catId)return;
+  if(S.current!==city||S.hexCat!==catId||city._hexGen!==gen)return;
   const pts=city.geom[catId]||[];
   const feats=grid.features;
   const mLat=111320;
