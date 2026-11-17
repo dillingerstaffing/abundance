@@ -83,6 +83,9 @@ button{font-family:var(--mono);cursor:pointer;color:var(--ink);background:none;b
 #dhead{padding:12px 14px 10px;border-bottom:1px solid var(--line)}
 #dhead .city{font-family:var(--mono);font-size:17px;font-weight:700;letter-spacing:.04em}
 #dhead .sub{color:var(--dim);font-size:11px;margin-top:2px;font-family:var(--mono)}
+#dfresh{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:7px;font-family:var(--mono);font-size:9.5px;letter-spacing:.06em;color:var(--faint)}
+#drefresh{border:1px solid var(--line2);border-radius:3px;padding:3px 8px;font-size:9.5px;letter-spacing:.08em;background:#10141a;color:var(--dim);flex:none}
+#drefresh:hover{border-color:var(--dim);color:var(--ink)}
 #scoreblock{display:flex;gap:0;border-bottom:1px solid var(--line)}
 .scorecell{flex:1;padding:9px 12px;border-right:1px solid var(--line)}
 .scorecell:last-child{border-right:none}
@@ -233,6 +236,7 @@ button{font-family:var(--mono);cursor:pointer;color:var(--ink);background:none;b
   <div id="dhead">
     <div class="city" id="d-city">United States</div>
     <div class="sub" id="d-sub">15 reference cities loaded as pins. Select one, or search any US city, to dig down.</div>
+    <div id="dfresh"><span id="dfresh-t">COUNTS · LOADING</span><button id="drefresh">REFRESH</button></div>
   </div>
   <div id="scoreblock">
     <div class="scorecell"><div class="k">Abundance</div><div class="v num" id="d-score">--</div><div class="d">Mean of six category scores, ranked against the 15 reference cities.</div></div>
@@ -244,7 +248,7 @@ button{font-family:var(--mono);cursor:pointer;color:var(--ink);background:none;b
       <button id="hexup" class="hbtn" style="margin-top:8px">DIG UP TO CITY</button></div>
     <div id="catrows"></div>
     <div id="blsstrip">National price context (BLS, monthly): loading...</div>
-    <div id="dfoot">Sources: US Census Bureau ACS via Census Reporter; OpenStreetMap via ohsome API (counts, with an Overpass count fallback) and Overpass API (hex geometry); Open-Meteo weather and air quality; US DOL wage table; BLS CPI. Every figure carries its source. A figure that fails to load shows as unavailable, never estimated. Counts and hex sites are cached on your device for a day and Census figures for a week, and the page backs off politely when a free service is busy, so repeat visits cost those services nothing. <a href="#" id="footmethod">Full method</a></div>
+    <div id="dfoot">Sources: US Census Bureau ACS via Census Reporter; OpenStreetMap via ohsome API (counts, with an Overpass count fallback) and Overpass API (hex geometry); Open-Meteo weather and air quality; US DOL wage table; BLS CPI. Every figure carries its source. A figure that fails to load shows as unavailable, never estimated. The page ships with a dated snapshot of the counts for the 15 reference cities, so they render immediately; a live refresh replaces them whenever the services answer, and the line under each city name states exactly how old its counts are. Counts and hex sites are also cached on your device for a day and Census figures for a week, and the page backs off politely when a free service is busy, so repeat visits cost those services nothing. <a href="#" id="footmethod">Full method</a></div>
   </div>
 </aside>
 
@@ -280,6 +284,7 @@ button{font-family:var(--mono);cursor:pointer;color:var(--ink);background:none;b
 </div></div>
 
 <script src="https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script src="data-snapshot.js"></script>
 <script>
 'use strict';
 /* ================= ASSEMBLY 5: DATA (constants) ================= */
@@ -316,7 +321,7 @@ const PRESETS=[
 const S={lens:'overview',drill:0,current:null,wage:15.92,wageDefault:15.92,ranges:null,hexCat:null,hexData:null,selHex:null,flying:false,styleDark:true};
 const cities=new Map(); // key: name+code -> city object
 const keyOf=c=>c.name+'|'+c.code;
-function mkCity(p){return Object.assign({acs:null,wx:null,aq:null,counts:{},countSrc:{},raw:{},scores:{},composite:null,geom:{},geomState:{},popHint:p.population||null},p)}
+function mkCity(p){return Object.assign({acs:null,wx:null,aq:null,counts:{},countSrc:{},countsFrom:null,countsBaseT:0,countsLiveT:0,liveCats:new Set(),raw:{},scores:{},composite:null,geom:{},geomState:{},popHint:p.population||null},p)}
 PRESETS.forEach(p=>{const c=mkCity(p);c.wageDef=p.wage||WAGES[p.code];cities.set(keyOf(c),c)});
 /* ================= helpers ================= */
 const fmt$=n=>n==null||isNaN(n)?'--':'$'+Math.round(n).toLocaleString('en-US');
@@ -373,6 +378,7 @@ function cacheSet(kind,id,v){
   try{localStorage.setItem(CACHE_KEY,JSON.stringify(c))}
   catch(err){Object.keys(c).forEach(k=>{if(k.indexOf('geom:')===0)delete c[k]});try{localStorage.setItem(CACHE_KEY,JSON.stringify(c))}catch(err2){}}
 }
+function cacheStamp(kind,id){const c=cacheLoad();const e=c[kind+':'+id];return e?e.t:0}
 function boxFor(city){
   const pop=city.acs?city.acs.pop:(city.popHint||50000);
   const halfKm=Math.min(16,Math.max(5,4+Math.sqrt(Math.max(pop,1000))/220));
@@ -422,8 +428,9 @@ async function fetchCounts(city){
     if(cached)CATS.forEach(c=>{if(out[c.id]==null&&cached[c.id]!=null){out[c.id]=cached[c.id];if(cached._src&&cached._src[c.id])city.countSrc[c.id]=cached._src[c.id]}});
   }
   const one=async cat=>{
-    const d=await fetchJSON(ohsomeURL(city,cat,false),12000);out[cat.id]=d.result[0].value;city.countSrc[cat.id]='ohsome';
+    const d=await fetchJSON(ohsomeURL(city,cat,false),12000);out[cat.id]=d.result[0].value;city.countSrc[cat.id]='ohsome';fetchedLive=true;
   };
+  let fetchedLive=false;
   const want=()=>CATS.filter(c=>out[c.id]==null);
   // one attempt per category per call, and no immediate retry round: spaced
   // retries live in the retry chain and the board sweeps, which is what
@@ -435,16 +442,80 @@ async function fetchCounts(city){
   // rely on ohsome plus the sweeps.
   const allowFb=(S.current&&keyOf(S.current)===keyOf(city))||city._fbOnce;
   if(allowFb&&want().length){
-    try{const oc=await overpassCounts(city,want());Object.keys(oc).forEach(k=>{out[k]=oc[k];city.countSrc[k]='overpass'})}catch(e){}
+    try{const oc=await overpassCounts(city,want());Object.keys(oc).forEach(k=>{out[k]=oc[k];city.countSrc[k]='overpass';fetchedLive=true})}catch(e){}
   }
   CATS.forEach(c=>{if(out[c.id]==null)out[c.id]=(city.counts&&city.counts[c.id]!=null)?city.counts[c.id]:null});
-  if(CATS.some(c=>out[c.id]!=null)){
+  // only a call that actually fetched something live may renew the cache
+  // stamp; re-stamping snapshot or saved figures would let day-old data
+  // pose as fresh forever
+  if(fetchedLive&&CATS.some(c=>out[c.id]!=null)){
     const snap={};CATS.forEach(c=>{if(out[c.id]!=null)snap[c.id]=out[c.id]});snap._src=Object.assign({},city.countSrc);
     cacheSet('counts',keyOf(city),snap);
   }
   return out;
   })();
   try{return await city._fc}finally{city._fc=null}
+}
+/* ============ never blank: snapshot floor + live refresh ============
+   The page ships with a dated snapshot of the counts (data-snapshot.js,
+   built from the same services by tools/build_snapshot.py). A preset city
+   therefore renders real numbers from the first paint, and a live refresh
+   replaces them whenever the services answer. Data that exists is never
+   taken away: a failed refresh leaves the dated figures on screen, and
+   the freshness line says exactly how old they are. */
+function fmtDT(t){
+  const d=new Date(t);
+  return d.toLocaleDateString('en-US',{month:'short',day:'numeric'}).toUpperCase()+', '+d.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'});
+}
+function seedCity(city){
+  const snap=window.ABUNDANCE_SNAPSHOT;
+  let asOf=0,from=null;
+  if(snap&&snap.counts&&snap.counts[keyOf(city)]){
+    const sc=snap.counts[keyOf(city)];
+    CATS.forEach(c=>{if(sc[c.id]!=null){city.counts[c.id]=sc[c.id];city.countSrc[c.id]='snapshot'}});
+    asOf=snap.asOf;from='snapshot';
+  }
+  const stamp=cacheStamp('counts',keyOf(city));
+  if(stamp>asOf){
+    const cached=cacheGet('counts',keyOf(city));
+    if(cached&&CATS.some(c=>cached[c.id]!=null)){
+      CATS.forEach(c=>{if(cached[c.id]!=null){city.counts[c.id]=cached[c.id];city.countSrc[c.id]=(cached._src&&cached._src[c.id])||'ohsome'}});
+      asOf=stamp;from='saved';
+    }
+  }
+  if(from){city.countsFrom=from;city.countsBaseT=asOf;computeRaw(city)}
+}
+function countsFresh(city){
+  const base=city.countsFrom==='snapshot'?('SNAPSHOT '+fmtDT(city.countsBaseT)):city.countsFrom==='saved'?('SAVED '+fmtDT(city.countsBaseT)):null;
+  if(city.liveCats&&city.liveCats.size>=CATS.length)return 'COUNTS · LIVE · '+fmtDT(city.countsLiveT);
+  if(city.countsLiveT)return 'COUNTS · LIVE FETCH '+fmtDT(city.countsLiveT)+(base?' · REST FROM '+base:'');
+  if(base)return 'COUNTS · FROM '+base+' · LIVE REFRESH PENDING';
+  return 'COUNTS · NOT LOADED YET';
+}
+async function refreshCounts(city){
+  // fetch every category fresh and merge what answers over whatever the
+  // city already shows (snapshot, saved, or older live). Nothing is ever
+  // cleared first, so a dead service changes nothing on screen.
+  if(city._rc)return city._rc;
+  city._rc=(async()=>{
+    const got={};
+    await Promise.all(CATS.map(async cat=>{
+      try{const d=await fetchJSON(ohsomeURL(city,cat,false),12000);got[cat.id]=d.result[0].value;city.countSrc[cat.id]='ohsome'}catch(e){}
+    }));
+    const missing=CATS.filter(c=>got[c.id]==null);
+    if(missing.length&&(S.current&&keyOf(S.current)===keyOf(city))){
+      try{const oc=await overpassCounts(city,missing);Object.keys(oc).forEach(k=>{got[k]=oc[k];city.countSrc[k]='overpass'})}catch(e){}
+    }
+    let any=false;
+    CATS.forEach(c=>{if(got[c.id]!=null){city.counts[c.id]=got[c.id];city.liveCats.add(c.id);any=true}});
+    if(any){
+      city.countsLiveT=Date.now();
+      const snap2={};CATS.forEach(c=>{if(city.counts[c.id]!=null)snap2[c.id]=city.counts[c.id]});snap2._src=Object.assign({},city.countSrc);
+      cacheSet('counts',keyOf(city),snap2);
+    }
+    return any;
+  })();
+  try{return await city._rc}finally{city._rc=null}
 }
 const OVERPASS_Q={
   housing:['["building"="apartments"]','["landuse"="construction"]'],
@@ -712,6 +783,7 @@ function renderDossier(city){
   if(!city){renderNation();return}
   $('d-city').textContent=city.name+(city.code?', '+city.code:'');
   $('d-sub').textContent=(city.acs&&city.acs.name?city.acs.name+' · ':'')+'Population '+(city.acs?fmtN(city.acs.pop):(city.popHint?fmtN(city.popHint):'--'))+' · median household income '+(city.acs?fmt$(city.acs.income):'--');
+  $('dfresh-t').textContent=countsFresh(city);$('drefresh').style.display='';
   $('d-score').textContent=city.composite==null?'--':city.composite;
   $('y-city').textContent=city.name;
   $('y-score').textContent=city.composite==null?'--':city.composite;
@@ -728,10 +800,11 @@ function renderDossier(city){
     const sc=city.scores?city.scores[cat.id]:null;
     const cnt=city.counts?city.counts[cat.id]:undefined;
     const state=cat.id==='housing'?(city.acs?'ok':'loading'):(cnt===undefined?'loading':(cnt===null?'fail':'ok'));
+    const prov=(state==='ok'&&cat.id!=='housing'&&!(city.liveCats&&city.liveCats.has(cat.id)))?(city.countSrc&&city.countSrc[cat.id]==='snapshot'?' · from snapshot '+fmtDT(city.countsBaseT):(city.countsFrom==='saved'?' · saved '+fmtDT(city.countsBaseT):'')):'';
     const div=document.createElement('div');div.className='catrow'+(S.lens===cat.id?' hot':'');
     div.innerHTML='<div class="r1"><span class="dot" style="background:'+cat.color+'"></span><span class="nm">'+cat.name+'</span><span class="sc num" style="color:'+cat.color+'">'+(sc==null?'--':sc)+'</span></div>'+
       '<div class="bar"><i style="width:'+(sc==null?0:sc)+'%;background:'+cat.color+'"></i></div>'+
-      '<div class="vals">'+catVals(city,cat)+'</div><div class="src">'+cat.src+(state==='ok'&&city.countSrc&&city.countSrc[cat.id]==='overpass'?' · via Overpass fallback':'')+(state==='loading'?' · loading':state==='fail'?' · unavailable, tap row to retry':'')+'</div>';
+      '<div class="vals">'+catVals(city,cat)+'</div><div class="src">'+cat.src+(state==='ok'&&city.countSrc&&city.countSrc[cat.id]==='overpass'?' · via Overpass fallback':'')+prov+(state==='loading'?' · loading':state==='fail'?' · unavailable, tap row to retry':'')+'</div>';
     div.addEventListener('click',()=>{
       if(state==='fail'){toast('Retrying '+cat.name+' counts...');loadCityData(city).then(()=>{if(S.current===city)renderDossier(city)})}
       else setLens(cat.id);
@@ -742,6 +815,10 @@ function renderDossier(city){
 }
 function renderNation(){
   $('d-city').textContent='United States';
+  const snapB=window.ABUNDANCE_SNAPSHOT;
+  const allLiveB=PRESETS.every(p=>{const c=cities.get(keyOf(p));return c&&c.liveCats&&c.liveCats.size>=CATS.length});
+  $('dfresh-t').textContent=allLiveB?'BOARD COUNTS · LIVE':(snapB?('BOARD COUNTS · SNAPSHOT '+fmtDT(snapB.asOf)+' · LIVE REFRESH RUNS IN BACKGROUND'):'BOARD COUNTS · LOADING');
+  $('drefresh').style.display='none';
   const ranked=PRESETS.map(p=>cities.get(keyOf(p))).filter(c=>c.composite!=null).sort((a,b)=>b.composite-a.composite);
   $('d-sub').textContent=ranked.length?('Reference cities ranked by Abundance Score. Select a pin or a row to dig down.'):'Loading reference cities...';
   $('d-score').textContent=ranked.length?ranked[0].composite:'--';
@@ -783,6 +860,12 @@ async function loadCityData(city){
     try{city.counts=await fetchCounts(city)}catch(e){}
     computeRaw(city);scoreCity(city);updatePin(city);
     if(S.current===city)renderDossier(city);
+  }else if(city.liveCats.size<CATS.length&&!city._openRefreshed){
+    // the city already renders (snapshot or saved figures); opening it asks
+    // once for the latest live counts in the background, and they replace
+    // the dated figures in place if the services answer
+    city._openRefreshed=true;
+    refreshCounts(city).then(any=>{if(any){computeRaw(city);buildRanges();updatePin(city);if(S.current===city)renderDossier(city)}}).catch(()=>{});
   }
 }
 async function selectCity(city,opts){
@@ -982,6 +1065,17 @@ document.addEventListener('keydown',e=>{
 });
 /* ================= boot ================= */
 (async function boot(){
+  // the never-blank floor: every preset city starts from the bundled dated
+  // snapshot (or fresher figures saved on this device) and renders at once
+  PRESETS.forEach(p=>seedCity(cities.get(keyOf(p))));
+  $('drefresh').addEventListener('click',async()=>{
+    const city=S.current;if(!city)return;
+    toast('Refreshing '+city.name+' counts live...',2000);
+    const any=await refreshCounts(city).catch(()=>false);
+    computeRaw(city);buildRanges();updatePin(city);
+    if(S.current===city)renderDossier(city);
+    toast(any?(city.liveCats.size>=CATS.length?city.name+' counts are live now':'Some counts refreshed live; the rest still show the dated figures'):'Live refresh did not get through. The dated figures below still stand.',3800);
+  });
   buildRail();setCrumbs();renderNation();setInterval(tickClock,1000);tickClock();
   try{initMap()}catch(e){toast('Map library failed to load. Check connection and reload.',6000)}
   loadBLS();
@@ -1014,11 +1108,14 @@ document.addEventListener('keydown',e=>{
   await Promise.all([0,1].map(async()=>{
     while(queue.length){
       const p=queue.shift();const c=cities.get(keyOf(p));
-      try{c.counts=await fetchCounts(c)}catch(e){}
+      if(CATS.some(k=>c.counts[k.id]==null)){try{c.counts=await fetchCounts(c)}catch(e){}}
+      else if(c.liveCats.size<CATS.length){await refreshCounts(c).catch(()=>{})}
       computeRaw(c);buildRanges();updatePin(c);if(S.drill===0)renderNation();
       await new Promise(r=>setTimeout(r,600)); // pace the board's requests
     }
   }));
+  // the home city renders from its snapshot like the rest; refresh it live too
+  if(home&&home.liveCats.size<CATS.length){await refreshCounts(home).catch(()=>{});computeRaw(home);buildRanges();updatePin(home);if(S.current===home)renderDossier(home)}
   // recovery sweep: a city whose counts failed both rounds is retried once more,
   // so a throttled burst cannot strand its pin on ".." for the whole session
   const stranded=PRESETS.map(p=>cities.get(keyOf(p))).filter(c=>c&&CATS.some(k=>!c.counts||c.counts[k.id]==null));
