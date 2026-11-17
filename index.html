@@ -596,7 +596,7 @@ function ovpRelease(){
   if(next)next();else _ovpActive--;
 }
 async function overpassQueryRaw(ql,timeoutMs){
-  const eps=['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter','https://overpass.nchc.org.tw/api/interpreter','https://overpass.private.coffee/api/interpreter'];
+  const eps=['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter','https://overpass.osm.ch/api/interpreter','https://overpass.nchc.org.tw/api/interpreter','https://overpass.openstreetmap.fr/api/interpreter','https://overpass.private.coffee/api/interpreter'];
   let lastErr=null;
   for(const ep of eps){
     const host=new URL(ep).hostname;
@@ -642,7 +642,7 @@ async function fetchGeomRaw(city,cat){
   const hitGeom=cacheGet('geom',ck);if(hitGeom)return hitGeom;
   const b=boxFor(city);const bbox=b.s+','+b.w+','+b.n+','+b.e;
   const parts=OVERPASS_Q[cat.id].map(t=>'nwr'+t+'('+bbox+');').join('');
-  const d=await overpassQuery('[out:json][timeout:35];('+parts+');out center 900;',undefined,S.current&&keyOf(S.current)===keyOf(city));
+  const d=await overpassQuery('[out:json][timeout:35];('+parts+');out center 900;',30000,S.current&&keyOf(S.current)===keyOf(city));
   const pts=[];
   (d.elements||[]).forEach(el=>{
     const lat=el.lat!=null?el.lat:(el.center?el.center.lat:null);
@@ -956,19 +956,25 @@ async function selectCity(city,opts){
   if(missingC)scheduleCountsRetry(city);
 }
 function scheduleCountsRetry(city){
-  // while a city's counts are missing, keep retrying on a slow clock for up to
-  // about 22 minutes: a flapping counts service then completes the dossier on
+  // while a city is missing data, keep retrying on a slow clock for up to
+  // about 22 minutes: a flapping service then completes the dossier on
   // its own. The chain survives navigation: drilling up or opening another
   // city pauses this city's fetching, it does not cancel its healing.
   if(city._retryN!=null)return;
   city._retryN=0;
   const step=async()=>{
     city._retryN++;
-    if(!CATS.some(c=>!city.counts||city.counts[c.id]==null)){city._retryN=null;return}
+    // healing covers everything the dossier needs, not just counts: a
+    // Census failure at open otherwise stranded the housing row, the
+    // burden figures, and the city's scores for the whole session, and
+    // failed hex site data was never retried at all
+    const missing=()=>CATS.some(c=>!city.counts||city.counts[c.id]==null)||(city.geoid&&!city.acs);
+    if(!missing()){city._retryN=null;return}
     if(S.current===city&&S.drill>=1){
-      try{city.counts=await fetchCounts(city)}catch(e){}
+      await loadCityData(city).catch(()=>{});
+      if(city.geomState[S.hexCat]==='fail')drawHexes();
       commit();
-      if(!CATS.some(c=>!city.counts||city.counts[c.id]==null)){
+      if(!missing()){
         toast(city.name+' ready',1400);city._retryN=null;return;
       }
     }
@@ -1081,13 +1087,14 @@ $('q').addEventListener('input',e=>{
           toast('Resolving Census place for '+r.name+'...');
           const pl=await resolvePlace(r.latitude,r.longitude);
           if(pl)city.geoid=pl.geoid;
+          else toast('No Census place found for '+r.name+'; its Census figures will be unavailable.',3600);
           cities.set(keyOf(city),city);
           selectCity(city,{fly:true});
         });
         box.appendChild(div);
       });
       box.style.display='block';
-    }catch(err){}
+    }catch(err){toast('City search unavailable right now. Try again in a moment.',3200)}
   },260);
 });
 document.addEventListener('click',e=>{if(!$('searchwrap').contains(e.target))$('qres').style.display='none'});
@@ -1162,6 +1169,7 @@ document.addEventListener('keydown',e=>{
   await Promise.all([0,1].map(async()=>{
     while(queue.length){
       const p=queue.shift();const c=cities.get(keyOf(p));
+      if(!c.acs&&c.geoid){try{c.acs=await fetchACS(c)}catch(e){}}
       if(CATS.some(k=>c.counts[k.id]==null)){try{c.counts=await fetchCounts(c)}catch(e){}}
       else if(c.liveCats.size<CATS.length){await refreshCounts(c).catch(()=>{})}
       commit();
@@ -1172,32 +1180,34 @@ document.addEventListener('keydown',e=>{
   if(home&&home.liveCats.size<CATS.length){await refreshCounts(home).catch(()=>{});commit()}
   // recovery sweep: a city whose counts failed both rounds is retried once more,
   // so a throttled burst cannot strand its pin on ".." for the whole session
-  const stranded=PRESETS.map(p=>cities.get(keyOf(p))).filter(c=>c&&CATS.some(k=>!c.counts||c.counts[k.id]==null));
+  const stranded=PRESETS.map(p=>cities.get(keyOf(p))).filter(c=>c&&(CATS.some(k=>!c.counts||c.counts[k.id]==null)||(c.geoid&&!c.acs)));
   if(stranded.length){
     await new Promise(r=>setTimeout(r,3000));
     const q2=stranded.slice();
     await Promise.all([0,1].map(async()=>{
       while(q2.length){
         const c=q2.shift();
+        if(!c.acs&&c.geoid){try{c.acs=await fetchACS(c)}catch(e){}}
         c._fbOnce=true;
         try{c.counts=await fetchCounts(c)}catch(e){}
         c._fbOnce=false;
         commit();
       }
     }));
-    const still=PRESETS.map(p=>cities.get(keyOf(p))).filter(c=>c&&CATS.some(k=>!c.counts||c.counts[k.id]==null));
-    if(still.length)toast('Some reference cities could not finish loading counts. Tap a city pin to retry it.',7000);
+    const still=PRESETS.map(p=>cities.get(keyOf(p))).filter(c=>c&&(CATS.some(k=>!c.counts||c.counts[k.id]==null)||(c.geoid&&!c.acs)));
+    if(still.length)toast('Some reference cities could not finish loading. Tap a city pin to retry it.',7000);
   }
   // re-sweeps: while any city is still stranded, sweep again every 10 minutes
   // (up to 3 more times), so a long throttle window does not strand the board
   for(let round=0;round<3;round++){
-    const left=PRESETS.map(p=>cities.get(keyOf(p))).filter(c=>c&&CATS.some(k=>!c.counts||c.counts[k.id]==null));
+    const left=PRESETS.map(p=>cities.get(keyOf(p))).filter(c=>c&&(CATS.some(k=>!c.counts||c.counts[k.id]==null)||(c.geoid&&!c.acs)));
     if(!left.length)break;
     await new Promise(r=>setTimeout(r,600000));
     const q3=left.slice();
     await Promise.all([0,1].map(async()=>{
       while(q3.length){
         const c=q3.shift();
+        if(!c.acs&&c.geoid){try{c.acs=await fetchACS(c)}catch(e){}}
         c._fbOnce=true;
         try{c.counts=await fetchCounts(c)}catch(e){}
         c._fbOnce=false;
