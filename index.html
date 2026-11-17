@@ -733,20 +733,24 @@ async function selectCity(city,opts){
   if(missingC)scheduleCountsRetry(city);
 }
 function scheduleCountsRetry(city){
-  // while a city stays open with counts missing, keep retrying on a slow clock:
-  // a flapping counts service then completes the dossier on its own
+  // while a city's counts are missing, keep retrying on a slow clock for up to
+  // about 22 minutes: a flapping counts service then completes the dossier on
+  // its own. The chain survives navigation: drilling up or opening another
+  // city pauses this city's fetching, it does not cancel its healing.
   if(city._retryN!=null)return;
   city._retryN=0;
   const step=async()=>{
     city._retryN++;
-    if(S.current!==city||S.drill===0){city._retryN=null;return}
     if(!CATS.some(c=>!city.counts||city.counts[c.id]==null)){city._retryN=null;return}
-    try{city.counts=await fetchCounts(city)}catch(e){}
-    computeRaw(city);buildRanges();updatePin(city);
-    if(S.current===city)renderDossier(city);
-    const stillMissing=CATS.some(c=>!city.counts||city.counts[c.id]==null);
-    if(!stillMissing&&S.current===city)toast(city.name+' ready',1400);
-    if(stillMissing&&city._retryN<5){
+    if(S.current===city&&S.drill>=1){
+      try{city.counts=await fetchCounts(city)}catch(e){}
+      computeRaw(city);buildRanges();updatePin(city);
+      if(S.current===city)renderDossier(city);
+      if(!CATS.some(c=>!city.counts||city.counts[c.id]==null)){
+        toast(city.name+' ready',1400);city._retryN=null;return;
+      }
+    }
+    if(city._retryN<12){
       city._retryT=setTimeout(step,city._retryN<2?45000:120000);
     }else city._retryN=null;
   };
@@ -958,6 +962,23 @@ document.addEventListener('keydown',e=>{
     }));
     const still=PRESETS.map(p=>cities.get(keyOf(p))).filter(c=>c&&CATS.some(k=>!c.counts||c.counts[k.id]==null));
     if(still.length)toast('Some reference cities could not finish loading counts. Tap a city pin to retry it.',7000);
+  }
+  // re-sweeps: while any city is still stranded, sweep again every 4 minutes
+  // (up to 4 more times), so a long throttle window does not strand the board
+  for(let round=0;round<4;round++){
+    const left=PRESETS.map(p=>cities.get(keyOf(p))).filter(c=>c&&CATS.some(k=>!c.counts||c.counts[k.id]==null));
+    if(!left.length)break;
+    await new Promise(r=>setTimeout(r,240000));
+    const q3=left.slice();
+    await Promise.all([0,1].map(async()=>{
+      while(q3.length){
+        const c=q3.shift();
+        c._fbOnce=true;
+        try{c.counts=await fetchCounts(c)}catch(e){}
+        c._fbOnce=false;
+        computeRaw(c);buildRanges();updatePin(c);if(S.drill===0)renderNation();
+      }
+    }));
   }
   buildRanges();if(S.drill===0)renderNation();
 })();
