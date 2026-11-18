@@ -464,7 +464,18 @@ async function fetchAQ(city){
 }
 function ohsomeURL(city,cat,geom){
   const b=boxFor(city);const bb=b.w+','+b.s+','+b.e+','+b.n;
-  return 'https://api.ohsome.org/v1/elements/'+(geom?'geometry':'count')+'?bboxes='+bb+'&filter='+encodeURIComponent(cat.osm);
+  return 'https://api.ohsome.org/v1/elements/'+(geom?'geometry':'count')+'?bboxes='+bb+'&filter='+encodeURIComponent(cat.osm)+'&timeout=25';
+}
+/* Counts go through a paced single-file queue: firing all six categories
+   at once (plus a background refresh of another city) bursts the counting
+   service, earns throttles, and the failures pile into the circuit
+   breaker before any success can reset it. One at a time, a breath
+   apart, each query lands like the single direct request that works. */
+let _cqTail=Promise.resolve();
+function countsQueue(fn){
+  const p=_cqTail.then(fn,fn);
+  _cqTail=p.then(()=>new Promise(r=>setTimeout(r,350)),()=>new Promise(r=>setTimeout(r,350)));
+  return p;
 }
 async function fetchCounts(city){
   if(city._fc)return city._fc;
@@ -481,7 +492,7 @@ async function fetchCounts(city){
     if(cached)CATS.forEach(c=>{if(out[c.id]==null&&cached[c.id]!=null){out[c.id]=cached[c.id];if(cached._src&&cached._src[c.id])city.countSrc[c.id]=cached._src[c.id]}});
   }
   const one=async cat=>{
-    const d=await fetchJSON(ohsomeURL(city,cat,false),30000);out[cat.id]=d.result[0].value;city.countSrc[cat.id]='ohsome';fetchedLive=true;liveNow.add(cat.id);
+    const d=await countsQueue(()=>fetchJSON(ohsomeURL(city,cat,false),30000));out[cat.id]=d.result[0].value;city.countSrc[cat.id]='ohsome';fetchedLive=true;liveNow.add(cat.id);
   };
   let fetchedLive=false;
   const liveNow=new Set();
@@ -590,7 +601,7 @@ async function refreshCounts(city){
   city._rc=(async()=>{
     const got={};
     await Promise.all(CATS.map(async cat=>{
-      try{const d=await fetchJSON(ohsomeURL(city,cat,false),12000);got[cat.id]=d.result[0].value;city.countSrc[cat.id]='ohsome'}catch(e){}
+      try{const d=await countsQueue(()=>fetchJSON(ohsomeURL(city,cat,false),30000));got[cat.id]=d.result[0].value;city.countSrc[cat.id]='ohsome'}catch(e){}
     }));
     const missing=CATS.filter(c=>got[c.id]==null);
     if(missing.length&&(S.current&&keyOf(S.current)===keyOf(city))){
@@ -879,17 +890,44 @@ async function drawHexes(){
   const src0=map.getSource('hexes');if(src0)src0.setData(grid);
   const leg=$('leg-label');if(leg)leg.textContent=(isOv?'SITES PER HEX · ALL CATEGORIES':cat.name.toUpperCase()+' PER HEX')+((isOv?CATS.some(c=>!city.geom[c.id]):!city.geom[catId])?' · LOADING':'');
   if(isOv){
-    // Overview carries every category at once: fetch whatever geometry is
-    // missing, politely, in rail order. Each category is normalized against
-    // its own densest cell before the sum, so a numerous category (stops)
-    // cannot drown a sparse one (markets) off the color scale.
+    // Overview carries every category at once. Each category is normalized
+    // against its own densest cell before the sum, so a numerous category
+    // (stops) cannot drown a sparse one (markets) off the color scale. What
+    // is already on hand (bundle, cache, earlier fetches) paints at once;
+    // missing categories join as they land instead of holding the whole
+    // field hostage to the slowest service.
+    const feats=grid.features;
+    const mLatOv=111320;
+    const paintOv=()=>{
+      feats.forEach(f=>{f.properties.count=0;f.properties.sites=0;f._ov=null});
+      CATS.forEach(c=>{
+        const pts=city.geom[c.id];if(!pts||!pts.length)return;
+        const cellPts=new Map();
+        pts.forEach(p=>{
+          let best=null,bd=1e18;
+          feats.forEach(f=>{
+            const ddx=(f.properties.cx-p.lon)*mLatOv*Math.cos(p.lat*Math.PI/180),ddy=(f.properties.cy-p.lat)*mLatOv;
+            const d=ddx*ddx+ddy*ddy;if(d<bd){bd=d;best=f}
+          });
+          if(best&&bd<(grid.R*1.1)*(grid.R*1.1)){if(!cellPts.has(best))cellPts.set(best,[]);cellPts.get(best).push(p)}
+        });
+        let max=0;cellPts.forEach(a=>{if(a.length>max)max=a.length});
+        if(!max)return;
+        cellPts.forEach((a,f)=>{f.properties.count+=Math.max(1,Math.round(6*a.length/max));f._ov=f._ov||{};f._ov[c.id]=a;f.properties.sites=(f.properties.sites||0)+a.length});
+      });
+      const src=map.getSource('hexes');if(src)src.setData(grid);
+      if(leg)leg.textContent='SITES PER HEX · ALL CATEGORIES'+(CATS.some(c=>city.geomState[c.id]==='loading')?' · LOADING':(CATS.every(c=>!city.geom[c.id])&&CATS.some(c=>city.geomState[c.id]==='fail')?' · UNAVAILABLE':''));
+      if(S.drill===2&&S.selHex!=null)fillHexPanel();
+    };
+    paintOv();
     for(const c of CATS){
       if(city.geom[c.id])continue;
       city.geomState[c.id]='loading';
-      if(S.drill===2&&S.selHex!=null)fillHexPanel();
+      paintOv();
       try{city.geom[c.id]=await fetchGeom(city,c);city.geomState[c.id]='ok'}
       catch(e){city.geomState[c.id]='fail'}
       if(S.current!==city||S.hexCat!==catId||city._hexGen!==gen)return;
+      paintOv();
     }
     // snapshot-sourced points refresh live in the background, once each
     city._ovBg=city._ovBg||new Set();
@@ -899,7 +937,9 @@ async function drawHexes(){
         fetchGeom(city,c).then(pts=>{if(pts&&pts.length){city.geom[c.id]=pts;city.geomFrom[c.id]='live';city.geomState[c.id]='ok';if(S.current===city&&S.hexCat==='overview')drawHexes()}}).catch(()=>{});
       }
     });
-  }else if(!city.geom[catId]){
+    return;
+  }
+  if(!city.geom[catId]){
     city.geomState[catId]='loading';
     if(S.drill===2&&S.selHex!=null)fillHexPanel();
     try{city.geom[catId]=await fetchGeom(city,cat);city.geomState[catId]='ok'}
@@ -908,27 +948,6 @@ async function drawHexes(){
   if(S.current!==city||S.hexCat!==catId||city._hexGen!==gen)return;
   const feats=grid.features;
   const mLat=111320;
-  if(isOv){
-    CATS.forEach(c=>{
-      const pts=city.geom[c.id];if(!pts||!pts.length)return;
-      const cellPts=new Map();
-      pts.forEach(p=>{
-        let best=null,bd=1e18;
-        feats.forEach(f=>{
-          const ddx=(f.properties.cx-p.lon)*mLat*Math.cos(p.lat*Math.PI/180),ddy=(f.properties.cy-p.lat)*mLat;
-          const d=ddx*ddx+ddy*ddy;if(d<bd){bd=d;best=f}
-        });
-        if(best&&bd<(grid.R*1.1)*(grid.R*1.1)){if(!cellPts.has(best))cellPts.set(best,[]);cellPts.get(best).push(p)}
-      });
-      let max=0;cellPts.forEach(a=>{if(a.length>max)max=a.length});
-      if(!max)return;
-      cellPts.forEach((a,f)=>{f.properties.count+=Math.max(1,Math.round(6*a.length/max));f._ov=f._ov||{};f._ov[c.id]=a;f.properties.sites=(f.properties.sites||0)+a.length});
-    });
-    const src=map.getSource('hexes');if(src)src.setData(grid);
-    if(leg)leg.textContent='SITES PER HEX · ALL CATEGORIES'+(CATS.every(c=>!city.geom[c.id])&&CATS.some(c=>city.geomState[c.id]==='fail')?' · UNAVAILABLE':'');
-    if(S.drill===2&&S.selHex!=null)fillHexPanel();
-    return;
-  }
   const pts=city.geom[catId]||[];
   pts.forEach(p=>{
     let best=null,bd=1e18;
