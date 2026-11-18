@@ -363,9 +363,9 @@ function render(){
     if(S.drill===0){
       if(S.hexData){S.hexData=null;const src=map.getSource('hexes');if(src)src.setData({type:'FeatureCollection',features:[]})}
     }else if(S.current){
-      const catId=S.lens==='overview'?'food':S.lens;
       const c=S.current;
-      const sig=keyOf(c)+'|'+catId+'|'+(S._hexNonce||0)+'|'+(c.geomState[catId]||'-')+'|'+(c.geom[catId]?c.geom[catId].length:-1)+'|'+(c.acs?c.acs.pop:0);
+      const hexSigPart=S.lens==='overview'?CATS.map(x=>(c.geom[x.id]?c.geom[x.id].length:-1)+':'+(c.geomState[x.id]||'-')).join(','):((c.geomState[S.lens]||'-')+'|'+(c.geom[S.lens]?c.geom[S.lens].length:-1));
+      const sig=keyOf(c)+'|'+S.lens+'|'+(S._hexNonce||0)+'|'+hexSigPart+'|'+(c.acs?c.acs.pop:0);
       if(sig!==S._hexSig){S._hexSig=sig;drawHexes()}
       if(map.getLayer('hexsel'))map.setFilter('hexsel',['==',['get','id'],S.selHex==null?-1:S.selHex]);
     }
@@ -880,6 +880,12 @@ async function drawHexes(){
   const catId=isOv?'overview':S.lens;
   const cat=isOv?null:CATS.find(c=>c.id===catId);if(!isOv&&!cat)return;
   S.hexCat=catId;
+  // if the geometry bundle has landed by now, seed from it before doing
+  // anything else: the bundle's load handler seeds every preset, but a
+  // city opened in the meantime must not wait for the next commit to
+  // notice (the overview signature below watches all six categories, and
+  // this call makes the seeding itself unconditional on draw)
+  if(window.ABUNDANCE_GEOM)seedGeom(city);
   // generation guard: overlapping draws (selectCity fires two, a lens change
   // a third) must not let an older draw's late geometry overwrite the grid
   // the panel reads, or the map and the panel end up describing different
@@ -1322,6 +1328,7 @@ document.addEventListener('keydown',e=>{
   // the reference cities' hex points seed from it and the views repaint
   const gscr=document.createElement('script');gscr.src='data-geometry.js';
   gscr.onload=()=>{PRESETS.forEach(p=>seedGeom(cities.get(keyOf(p))));commit()};
+  gscr.onerror=()=>{setTimeout(()=>{const r=document.createElement('script');r.src='data-geometry.js';r.onload=()=>{PRESETS.forEach(p=>seedGeom(cities.get(keyOf(p))));commit()};document.head.appendChild(r)},3000)};
   document.head.appendChild(gscr);
   $('drefresh').addEventListener('click',async()=>{
     const city=S.current;if(!city)return;
