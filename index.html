@@ -481,9 +481,10 @@ async function fetchCounts(city){
     if(cached)CATS.forEach(c=>{if(out[c.id]==null&&cached[c.id]!=null){out[c.id]=cached[c.id];if(cached._src&&cached._src[c.id])city.countSrc[c.id]=cached._src[c.id]}});
   }
   const one=async cat=>{
-    const d=await fetchJSON(ohsomeURL(city,cat,false),12000);out[cat.id]=d.result[0].value;city.countSrc[cat.id]='ohsome';fetchedLive=true;
+    const d=await fetchJSON(ohsomeURL(city,cat,false),30000);out[cat.id]=d.result[0].value;city.countSrc[cat.id]='ohsome';fetchedLive=true;liveNow.add(cat.id);
   };
   let fetchedLive=false;
+  const liveNow=new Set();
   const want=()=>CATS.filter(c=>out[c.id]==null);
   // one attempt per category per call, and no immediate retry round: spaced
   // retries live in the retry chain and the board sweeps, which is what
@@ -495,9 +496,18 @@ async function fetchCounts(city){
   // rely on ohsome plus the sweeps.
   const allowFb=(S.current&&keyOf(S.current)===keyOf(city))||city._fbOnce;
   if(allowFb&&want().length){
-    try{const oc=await overpassCounts(city,want());Object.keys(oc).forEach(k=>{out[k]=oc[k];city.countSrc[k]='overpass';fetchedLive=true})}catch(e){}
+    try{const oc=await overpassCounts(city,want());Object.keys(oc).forEach(k=>{out[k]=oc[k];city.countSrc[k]='overpass';fetchedLive=true;liveNow.add(k)})}catch(e){}
+  }
+  // the city on screen gets one more counts attempt after a short pause:
+  // a single slow answer (a big bounding box can take most of the timeout)
+  // should not strand the open dossier on a dead service's worst minute.
+  // Background cities never do this; their retries live in the sweeps.
+  if(allowFb&&want().length){
+    await new Promise(r=>setTimeout(r,6000));
+    await Promise.all(want().map(async cat=>{try{await one(cat)}catch(e){}}));
   }
   CATS.forEach(c=>{if(out[c.id]==null)out[c.id]=(city.counts&&city.counts[c.id]!=null)?city.counts[c.id]:null});
+  if(liveNow.size){liveNow.forEach(id=>city.liveCats.add(id));city.countsLiveT=Date.now()}
   // only a call that actually fetched something live may renew the cache
   // stamp; re-stamping snapshot or saved figures would let day-old data
   // pose as fresh forever
@@ -717,6 +727,16 @@ async function resolvePlace(lat,lon){
   }
   return null;
 }
+async function resolveGeocoder(lat,lon){
+  try{
+    const u='https://geocoding.geo.census.gov/geocoder/geographies/coordinates?x='+lon+'&y='+lat+'&benchmark=Public_AR_Current&vintage=Current_Current&format=json';
+    const d=await fetchJSON(u,15000);
+    const g=(d.result&&d.result.geographies)||{};
+    const pl=g['Incorporated Places']||g['Places'];
+    if(pl&&pl.length)return{geoid:pl[0].GEOID,name:pl[0].NAME};
+  }catch(e){}
+  return null;
+}
 /* ================= ASSEMBLY 6: SCORING ================= */
 function computeRaw(city){
   const pop=city.acs?city.acs.pop:(city.popHint||null);
@@ -845,8 +865,9 @@ function addHexLayers(){
 async function drawHexes(){
   if(!map)return;
   const city=S.current;if(!city||S.drill<1)return;
-  const catId=S.lens==='overview'?'food':S.lens;
-  const cat=CATS.find(c=>c.id===catId);if(!cat)return;
+  const isOv=S.lens==='overview';
+  const catId=isOv?'overview':S.lens;
+  const cat=isOv?null:CATS.find(c=>c.id===catId);if(!isOv&&!cat)return;
   S.hexCat=catId;
   // generation guard: overlapping draws (selectCity fires two, a lens change
   // a third) must not let an older draw's late geometry overwrite the grid
@@ -856,17 +877,59 @@ async function drawHexes(){
   // the field itself renders at once; counts land when the geometry arrives
   const grid=buildHexes(city);S.hexData=grid;
   const src0=map.getSource('hexes');if(src0)src0.setData(grid);
-  const leg=$('leg-label');if(leg)leg.textContent=cat.name.toUpperCase()+' PER HEX';
-  if(!city.geom[catId]){
+  const leg=$('leg-label');if(leg)leg.textContent=(isOv?'SITES PER HEX · ALL CATEGORIES':cat.name.toUpperCase()+' PER HEX')+((isOv?CATS.some(c=>!city.geom[c.id]):!city.geom[catId])?' · LOADING':'');
+  if(isOv){
+    // Overview carries every category at once: fetch whatever geometry is
+    // missing, politely, in rail order. Each category is normalized against
+    // its own densest cell before the sum, so a numerous category (stops)
+    // cannot drown a sparse one (markets) off the color scale.
+    for(const c of CATS){
+      if(city.geom[c.id])continue;
+      city.geomState[c.id]='loading';
+      if(S.drill===2&&S.selHex!=null)fillHexPanel();
+      try{city.geom[c.id]=await fetchGeom(city,c);city.geomState[c.id]='ok'}
+      catch(e){city.geomState[c.id]='fail'}
+      if(S.current!==city||S.hexCat!==catId||city._hexGen!==gen)return;
+    }
+    // snapshot-sourced points refresh live in the background, once each
+    city._ovBg=city._ovBg||new Set();
+    CATS.forEach(c=>{
+      if(city.geomFrom&&city.geomFrom[c.id]==='snapshot'&&!city._ovBg.has(c.id)){
+        city._ovBg.add(c.id);
+        fetchGeom(city,c).then(pts=>{if(pts&&pts.length){city.geom[c.id]=pts;city.geomFrom[c.id]='live';city.geomState[c.id]='ok';if(S.current===city&&S.hexCat==='overview')drawHexes()}}).catch(()=>{});
+      }
+    });
+  }else if(!city.geom[catId]){
     city.geomState[catId]='loading';
     if(S.drill===2&&S.selHex!=null)fillHexPanel();
     try{city.geom[catId]=await fetchGeom(city,cat);city.geomState[catId]='ok'}
     catch(e){city.geomState[catId]='fail';toast('Hex site data unavailable for '+cat.name+'. Tap a cell to retry.');if(S.current===city)scheduleCountsRetry(city)}
   }
   if(S.current!==city||S.hexCat!==catId||city._hexGen!==gen)return;
-  const pts=city.geom[catId]||[];
   const feats=grid.features;
   const mLat=111320;
+  if(isOv){
+    CATS.forEach(c=>{
+      const pts=city.geom[c.id];if(!pts||!pts.length)return;
+      const cellPts=new Map();
+      pts.forEach(p=>{
+        let best=null,bd=1e18;
+        feats.forEach(f=>{
+          const ddx=(f.properties.cx-p.lon)*mLat*Math.cos(p.lat*Math.PI/180),ddy=(f.properties.cy-p.lat)*mLat;
+          const d=ddx*ddx+ddy*ddy;if(d<bd){bd=d;best=f}
+        });
+        if(best&&bd<(grid.R*1.1)*(grid.R*1.1)){if(!cellPts.has(best))cellPts.set(best,[]);cellPts.get(best).push(p)}
+      });
+      let max=0;cellPts.forEach(a=>{if(a.length>max)max=a.length});
+      if(!max)return;
+      cellPts.forEach((a,f)=>{f.properties.count+=Math.max(1,Math.round(6*a.length/max));f._ov=f._ov||{};f._ov[c.id]=a;f.properties.sites=(f.properties.sites||0)+a.length});
+    });
+    const src=map.getSource('hexes');if(src)src.setData(grid);
+    if(leg)leg.textContent='SITES PER HEX · ALL CATEGORIES'+(CATS.every(c=>!city.geom[c.id])&&CATS.some(c=>city.geomState[c.id]==='fail')?' · UNAVAILABLE':'');
+    if(S.drill===2&&S.selHex!=null)fillHexPanel();
+    return;
+  }
+  const pts=city.geom[catId]||[];
   pts.forEach(p=>{
     let best=null,bd=1e18;
     feats.forEach(f=>{
@@ -876,6 +939,7 @@ async function drawHexes(){
     if(best&&bd<(grid.R*1.1)*(grid.R*1.1)){best.properties.count++;(best._pts=best._pts||[]).push(p)}
   });
   const src=map.getSource('hexes');if(src)src.setData(grid);
+  if(leg)leg.textContent=cat.name.toUpperCase()+' PER HEX'+(city.geomState[catId]==='fail'?' · UNAVAILABLE':'');
   if(S.drill===2&&S.selHex!=null)fillHexPanel();
 }
 /* ================= ASSEMBLY 4 + 3: DOSSIER AND DRILL STACK ================= */
@@ -971,7 +1035,18 @@ function setCrumbs(){
 }
 async function loadCityData(city){
   const jobs=[];
-  if(city.geoid&&!city.acs)jobs.push(fetchACS(city).then(a=>{city.acs=a}).catch(()=>{city.acs=null}));
+  if(!city.acs)jobs.push((async()=>{
+    // a searched city is born with no Census id; resolving it is part of
+    // loading and is retried on every load, never a one-shot at search
+    // time (a single failed resolve used to kill Census for that city
+    // silently, forever). Two official resolvers: TIGERweb point-in-
+    // polygon, then the Census Bureau's own geocoder.
+    if(!city.geoid){
+      const pl=await resolvePlace(city.lat,city.lon).catch(()=>null)||await resolveGeocoder(city.lat,city.lon).catch(()=>null);
+      if(pl)city.geoid=pl.geoid;
+    }
+    if(city.geoid)await fetchACS(city).then(a=>{city.acs=a}).catch(()=>{city.acs=null});
+  })());
   if(!city.wx||Date.now()-(city._wxT||0)>600000)jobs.push(fetchWX(city).then(w=>{city.wx=w;city._wxT=Date.now()}).catch(()=>{}));
   if(!city.aq||Date.now()-(city._aqT||0)>600000)jobs.push(fetchAQ(city).then(a=>{city.aq=a;city._aqT=Date.now()}).catch(()=>{}));
   const needCounts=CATS.some(c=>city.counts[c.id]==null);
@@ -1029,11 +1104,11 @@ function scheduleCountsRetry(city){
     // the snapshot, a failed site fetch is the ONLY missing piece, and
     // without it in this condition the chain never started and the
     // failure was never retried in the background at all.
-    const missing=()=>CATS.some(c=>!city.counts||city.counts[c.id]==null)||(city.geoid&&!city.acs)||(S.current===city&&city.geomState[S.hexCat]==='fail');
+    const missing=()=>CATS.some(c=>!city.counts||city.counts[c.id]==null)||!city.acs||(S.current===city&&!city.wx)||(S.current===city&&(city.geomState[S.hexCat]==='fail'||(S.hexCat==='overview'&&CATS.some(c=>city.geomState[c.id]==='fail'&&!city.geom[c.id]))));
     if(!missing()){city._retryN=null;return}
     if(S.current===city&&S.drill>=1){
       await loadCityData(city).catch(()=>{});
-      if(city.geomState[S.hexCat]==='fail')drawHexes();
+      if(city.geomState[S.hexCat]==='fail'||(S.hexCat==='overview'&&CATS.some(c=>city.geomState[c.id]==='fail'&&!city.geom[c.id])))drawHexes();
       commit();
       if(!missing()){
         toast(city.name+' ready',1400);city._retryN=null;return;
@@ -1045,7 +1120,7 @@ function scheduleCountsRetry(city){
       city._retryT=setTimeout(step,city._retryN<=1?60000:(city._retryN===2?180000:480000));
     }else city._retryN=null;
   };
-  city._retryT=setTimeout(step,60000);
+  city._retryT=setTimeout(step,25000);
 }
 function goNation(){
   S.drill=0;S.current=null;S.selHex=null;
@@ -1076,6 +1151,27 @@ function fillHexPanel(){
       b.addEventListener('click',()=>drawHexes());li.appendChild(b)}
     ul.appendChild(li);
   };
+  if(S.hexCat==='overview'){
+    const anyGeom=CATS.some(c=>city&&city.geom[c.id]&&city.geom[c.id].length);
+    const anyLoading=CATS.some(c=>city&&city.geomState[c.id]==='loading');
+    const totalAll=city?CATS.reduce((s,c)=>s+(city.geom[c.id]?city.geom[c.id].length:0),0):0;
+    const ov=f._ov||{};
+    const n=f.properties.sites||0;
+    if(!anyGeom&&anyLoading){$('hex-title').textContent='All categories · site data loading';addLi('Loading mapped sites from OpenStreetMap (Overpass), one category at a time. Colors land per category as it answers.');return}
+    if(!anyGeom){$('hex-title').textContent='All categories · site data unavailable';addLi('Overpass did not answer for any category, so this cell cannot be counted yet. Nothing here is estimated.',true);return}
+    $('hex-title').textContent='All categories · '+n+' mapped site'+(n===1?'':'s')+' in this cell'+(city?' · of '+totalAll+' mapped in '+city.name:'')+(anyLoading?' · more categories still loading':'');
+    if(!n){addLi('No mapped sites in this cell in any loaded category.');return}
+    CATS.forEach(c=>{
+      const a=ov[c.id];if(!a||!a.length)return;
+      addLi(c.name+' · '+a.length);
+      const named=a.filter(p=>p.name),unnamed=a.filter(p=>!p.name);
+      named.slice(0,12).forEach(p=>addLi('  '+p.name+(p.kind?' · '+p.kind:'')));
+      const byKind={};unnamed.forEach(p=>{const k=p.kind||'site';byKind[k]=(byKind[k]||0)+1});
+      Object.keys(byKind).sort().forEach(k=>addLi('  '+k+' x '+byKind[k]+' (unnamed in OpenStreetMap)'));
+      if(named.length>12)addLi('  + '+(named.length-12)+' more named '+c.name.toLowerCase()+' sites');
+    });
+    return;
+  }
   if(state==='loading'){
     $('hex-title').textContent=catName+' · site data loading';
     addLi('Loading mapped sites from OpenStreetMap (Overpass). The counts in this cell land when it answers.');
@@ -1218,6 +1314,14 @@ document.addEventListener('keydown',e=>{
   buildRail();commit();setInterval(tickClock,1000);tickClock();
   try{initMap()}catch(e){toast('Map library failed to load. Check connection and reload.',6000)}
   loadBLS();
+  // home city first, before anything else streams in: the app opens into
+  // Ocean City. This used to run after the all-cities fast pass, so on a
+  // slow connection the auto-open arrived late (or felt like it never
+  // happened). If the visitor has already picked a city themselves, the
+  // auto-open stands down and never yanks them back.
+  const home=cities.get(keyOf(PRESETS[0]));
+  let homeReady=Promise.resolve();
+  if(home&&!S.current)homeReady=selectCity(home,{fly:true});
   // fast pass: ACS + weather + air for all reference cities
   await Promise.allSettled(PRESETS.map(async p=>{
     const c=cities.get(keyOf(p));
@@ -1229,14 +1333,6 @@ document.addEventListener('keydown',e=>{
     commit();
   }));
   commit();
-  // home city first: its counts land and it opens before the rest stream in
-  const home=cities.get(keyOf(PRESETS[0]));
-  let homeReady=Promise.resolve();
-  if(home){
-    // open the home city immediately on its Census/weather/air data; its counts
-    // stream in behind the open dossier via loadCityData instead of gating it
-    homeReady=selectCity(home,{fly:true});
-  }
   // the background board waits until the home city has had the data services to
   // itself (or 30s, whichever comes first): firing all 15 cities' counts at
   // once throttles the shared services and starves the city on screen
