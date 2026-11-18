@@ -1332,6 +1332,36 @@ if(new URLSearchParams(location.search).has('harvest')){
     log('HARVEST DONE total points '+total+' · categories ok '+done+' / '+(PRESETS.length*CATS.length)+(failed.length?' · failed: '+failed.join(', '):''));
   })();
 }
+/* ================= geometry dump (maintenance mode) =================
+   Open with ?dump=1 in a browser that has fetched site points (they sit
+   in the app cache): rebuilds the bundle from the cache and offers a
+   real button for the download, because an automatic download fired by
+   script alone is blocked, while a clicked one is not. */
+if(new URLSearchParams(location.search).has('dump')){
+  (async()=>{
+    const pre=document.createElement('pre');
+    pre.style.cssText='position:fixed;inset:8px;z-index:999;background:#0a0e13;color:#cfe3ee;padding:12px;overflow:auto;font:11px/1.5 monospace;white-space:pre-wrap';
+    document.body.appendChild(pre);
+    const G={};let total=0,cats=0;
+    PRESETS.forEach(p=>{
+      const key=keyOf(p);G[key]={};
+      CATS.forEach(c=>{
+        const pts=cacheGet('geom',key+':'+c.id);
+        if(pts&&pts.length){G[key][c.id]=pts.map(pt=>[Math.round(pt.lon*1e5)/1e5,Math.round(pt.lat*1e5)/1e5,pt.name||'',pt.kind||'']);total+=pts.length;cats++}
+      });
+    });
+    pre.textContent='DUMP READY total points '+total+' · categories '+cats+'\n';
+    const btn=document.createElement('button');
+    btn.textContent='DOWNLOAD data-geometry.js';
+    btn.style.cssText='font:14px monospace;padding:12px 20px;margin-top:10px;display:block';
+    btn.addEventListener('click',()=>{
+      const blob=new Blob(['window.ABUNDANCE_GEOM='+JSON.stringify(G)+';\n'],{type:'text/javascript'});
+      const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='data-geometry.js';a.click();
+      pre.textContent+='download triggered\n';
+    });
+    pre.appendChild(btn);
+  })();
+}
 </script>
 </body>
 </html>
