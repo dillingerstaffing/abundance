@@ -922,7 +922,7 @@ async function drawHexes(){
         cellPts.forEach((a,f)=>{f.properties.count+=Math.max(1,Math.round(6*a.length/max));f._ov=f._ov||{};f._ov[c.id]=a;f.properties.sites=(f.properties.sites||0)+a.length});
       });
       const src=map.getSource('hexes');if(src)src.setData(grid);
-      if(leg)leg.textContent='SITES PER HEX · ALL CATEGORIES'+(CATS.some(c=>city.geomState[c.id]==='loading')?' · LOADING':(CATS.every(c=>!city.geom[c.id])&&CATS.some(c=>city.geomState[c.id]==='fail')?' · UNAVAILABLE':''));
+      if(leg)leg.textContent='SITES PER HEX · ALL CATEGORIES'+(CATS.some(c=>city.geomState[c.id]==='loading')?(CATS.some(c=>city.geom[c.id])?' · UPDATING':' · LOADING'):(CATS.every(c=>!city.geom[c.id])&&CATS.some(c=>city.geomState[c.id]==='fail')?' · UNAVAILABLE':''));
       if(S.drill===2&&S.selHex!=null)fillHexPanel();
     };
     paintOv();
