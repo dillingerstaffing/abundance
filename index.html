@@ -401,7 +401,14 @@ async function fetchJSON(url,ms){
     return await r.json();
   }catch(e){
     if(e&&/^HTTP /.test(e.message))throw e;
-    hostFail(host,null);
+    // a client-side timeout abort means the service is SLOW, not down:
+    // counting it as a host failure lets three slow answers open the
+    // circuit breaker and black out a healthy host, after which every
+    // call fails instantly and the blackout keeps renewing itself
+    // (the Nov 22 geometry collapse: every Overpass instance cooling
+    // down at once while merely busy). Slow is handled by budgets and
+    // retries, never by the breaker.
+    if(!(e&&e.name==='AbortError'))hostFail(host,null);
     throw e;
   }
   finally{clearTimeout(h)}
@@ -720,7 +727,7 @@ async function overpassQueryRaw(ql,timeoutMs,shouldStop){
       }
       hostOk(host);
       return await r.json();
-    }catch(e){lastErr=e;if(!(e&&(/^HTTP /.test(e.message)||/^cooling down/.test(e.message))))hostFail(host,null)}
+    }catch(e){lastErr=e;if(!(e&&(/^HTTP /.test(e.message)||/^cooling down/.test(e.message)||e.name==='AbortError')))hostFail(host,null)}
   }
   throw lastErr||new Error('overpass failed');
 }
@@ -761,9 +768,10 @@ async function fetchGeomRaw(city,cat,shouldStop){
   // kills: its scan is too big and the reply never lands, which is why
   // large cities showed empty hexes while small ones filled. Large boxes
   // are tiled into quadrants, each a quarter of the scan, and the points
-  // merged. The per-endpoint budget is 60 s: a slow but legitimate query
-  // must be allowed to finish instead of being cut at 30 s on every
-  // endpoint in turn.
+  // merged. The per-endpoint budget is 50 s: the query itself carries a
+  // 45 s server-side limit, so a legitimate answer lands inside 50 s,
+  // and a dead endpoint is abandoned shortly after the server would
+  // have given up on it anyway.
   const boxes=[];
   if((b.n-b.s)*(b.e-b.w)>0.02){
     const mLat=(b.s+b.n)/2,mLon=(b.w+b.e)/2;
@@ -782,7 +790,15 @@ async function fetchGeomRaw(city,cat,shouldStop){
   const perTile=await Promise.all(boxes.map(async q=>{
     const bbox=q[0]+','+q[1]+','+q[2]+','+q[3];
     const parts=OVERPASS_Q[cat.id].map(t=>'nwr'+t+'('+bbox+');').join('');
-    try{return await overpassQuery('[out:json][timeout:45];('+parts+');out center 900;',60000,S.current&&keyOf(S.current)===keyOf(city),shouldStop)}
+    try{
+      const d=await overpassQuery('[out:json][timeout:45];('+parts+');out center 900;',50000,S.current&&keyOf(S.current)===keyOf(city),shouldStop);
+      // the server gives up on a heavy tile at its own 45 s limit and
+      // says so in a remark on an otherwise successful reply: that is
+      // a failed tile, not an empty quadrant, and counting it as an
+      // answer would paint missing ground as surveyed ground
+      if(d&&d.remark&&/timed out/i.test(d.remark))throw new Error('tile timed out');
+      return d;
+    }
     catch(e){return null}
   }));
   const seen=new Set(),pts=[];
@@ -1056,6 +1072,10 @@ async function drawHexes(){
         cellPts.forEach((a,f)=>{f.properties.count+=Math.max(1,Math.round(6*a.length/max));f._ov=f._ov||{};f._ov[c.id]=a;f.properties.sites=(f.properties.sites||0)+a.length});
       });
       const src=map.getSource('hexes');if(src)src.setData(grid);
+      // sites on the map retire any failure note on sight: the note
+      // claims site data is unavailable, and the paint is the refutation
+      const hnP=$('hexnote');
+      if(hnP&&hnP.textContent.indexOf('Hex site data unavailable')===0)hnP.textContent='';
       if(leg)leg.textContent='SITES PER HEX · ALL CATEGORIES'+(CATS.some(c=>city.geomState[c.id]==='loading')?(CATS.some(c=>city.geom[c.id])?' · UPDATING':' · LOADING'):(CATS.every(c=>!city.geom[c.id])&&CATS.some(c=>city.geomState[c.id]==='fail')?' · UNAVAILABLE':''));
       if(S.drill===2&&S.selHex!=null)fillHexPanel();
     };
@@ -1118,7 +1138,11 @@ async function drawHexes(){
   // points on the map outrank a stale state stamp: a background fetch
   // that failed after the bundle seeded this category used to leave
   // the legend reading UNAVAILABLE over a field that had just painted
-  if(pts.length)city.geomState[catId]='ok';
+  if(pts.length){
+    city.geomState[catId]='ok';
+    const hnS=$('hexnote');
+    if(hnS&&hnS.textContent.indexOf('Hex site data unavailable')===0)hnS.textContent='';
+  }
   if(leg)leg.textContent=cat.name.toUpperCase()+' PER HEX'+(city.geomState[catId]==='fail'?' · UNAVAILABLE':'');
   if(S.drill===2&&S.selHex!=null)fillHexPanel();
 }
