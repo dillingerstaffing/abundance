@@ -470,13 +470,32 @@ function ohsomeURL(city,cat,geom){
    at once (plus a background refresh of another city) bursts the counting
    service, earns throttles, and the failures pile into the circuit
    breaker before any success can reset it. One at a time, a breath
-   apart, each query lands like the single direct request that works. */
-let _cqTail=Promise.resolve();
-function countsQueue(fn){
-  const p=_cqTail.then(fn,fn);
-  _cqTail=p.then(()=>new Promise(r=>setTimeout(r,350)),()=>new Promise(r=>setTimeout(r,350)));
-  return p;
+   apart, each query lands like the single direct request that works.
+   The queue has TWO lanes. A plain FIFO starved the city on screen: on a
+   cold open the background board queues dozens of refresh calls (15
+   cities x 6 categories, each several seconds), and a city the user had
+   just searched for waited behind all of them, its rows stuck on LOADING
+   for many minutes (Philadelphia and Atlantic City, Nov 22). Calls for
+   the city on screen take the priority lane and run next, ahead of every
+   waiting background call; background work keeps its single-file pacing
+   behind them. */
+let _cqRun=false;const _cqPrio=[],_cqNorm=[];
+function countsQueue(fn,prio){
+  return new Promise((res,rej)=>{
+    (prio?_cqPrio:_cqNorm).push({fn:fn,res:res,rej:rej});
+    cqPump();
+  });
 }
+function cqPump(){
+  if(_cqRun)return;
+  const job=_cqPrio.shift()||_cqNorm.shift();
+  if(!job)return;
+  _cqRun=true;
+  Promise.resolve().then(job.fn).then(job.res,job.rej).then(()=>{
+    setTimeout(()=>{_cqRun=false;cqPump()},350);
+  });
+}
+const cqPrioFor=city=>!!(S.current&&keyOf(S.current)===keyOf(city));
 async function fetchCounts(city){
   if(city._fc)return city._fc;
   city._fc=(async()=>{
@@ -492,7 +511,7 @@ async function fetchCounts(city){
     if(cached)CATS.forEach(c=>{if(out[c.id]==null&&cached[c.id]!=null){out[c.id]=cached[c.id];if(cached._src&&cached._src[c.id])city.countSrc[c.id]=cached._src[c.id]}});
   }
   const one=async cat=>{
-    const d=await countsQueue(()=>fetchJSON(ohsomeURL(city,cat,false),30000));out[cat.id]=d.result[0].value;city.countSrc[cat.id]='ohsome';fetchedLive=true;liveNow.add(cat.id);
+    const d=await countsQueue(()=>fetchJSON(ohsomeURL(city,cat,false),30000),cqPrioFor(city));out[cat.id]=d.result[0].value;city.countSrc[cat.id]='ohsome';fetchedLive=true;liveNow.add(cat.id);
   };
   let fetchedLive=false;
   const liveNow=new Set();
@@ -601,7 +620,7 @@ async function refreshCounts(city){
   city._rc=(async()=>{
     const got={};
     await Promise.all(CATS.map(async cat=>{
-      try{const d=await countsQueue(()=>fetchJSON(ohsomeURL(city,cat,false),30000));got[cat.id]=d.result[0].value;city.countSrc[cat.id]='ohsome'}catch(e){}
+      try{const d=await countsQueue(()=>fetchJSON(ohsomeURL(city,cat,false),30000),cqPrioFor(city));got[cat.id]=d.result[0].value;city.countSrc[cat.id]='ohsome'}catch(e){}
     }));
     const missing=CATS.filter(c=>got[c.id]==null);
     if(missing.length&&(S.current&&keyOf(S.current)===keyOf(city))){
@@ -692,7 +711,14 @@ async function fetchGeom(city,cat){
   if(city._fg[cat.id])return city._fg[cat.id];
   const p=fetchGeomRaw(city,cat);
   city._fg[cat.id]=p;
-  try{return await p}finally{delete city._fg[cat.id]}
+  try{
+    const pts=await p;
+    // a partial tile result paints what answered and is flagged, so the
+    // draw and the healing chain know to re-ask for the missing ground
+    city._geomPartial=city._geomPartial||{};
+    if(pts&&pts._partial)city._geomPartial[cat.id]=1;else delete city._geomPartial[cat.id];
+    return pts;
+  }finally{delete city._fg[cat.id]}
 }
 async function fetchGeomRaw(city,cat){
   const ck=keyOf(city)+':'+cat.id;
@@ -711,10 +737,21 @@ async function fetchGeomRaw(city,cat){
     boxes.push([b.s,b.w,mLat,mLon],[b.s,mLon,mLat,b.e],[mLat,b.w,b.n,mLon],[mLat,mLon,b.n,b.e]);
   }else boxes.push([b.s,b.w,b.n,b.e]);
   const seen=new Set(),pts=[];
+  // tiles fail independently: one dead quadrant must not discard the
+  // points the other three returned (until Nov 22 a single failed tile
+  // rejected the whole category, which is why big searched cities showed
+  // empty hex fields while small ones filled). The category fails only
+  // when NO tile answers. A partial merge is returned uncached and
+  // flagged, so it paints now and is re-asked later instead of posing
+  // as the complete picture for a day.
+  let answered=0;
   for(const q of boxes){
     const bbox=q[0]+','+q[1]+','+q[2]+','+q[3];
     const parts=OVERPASS_Q[cat.id].map(t=>'nwr'+t+'('+bbox+');').join('');
-    const d=await overpassQuery('[out:json][timeout:45];('+parts+');out center 900;',60000,S.current&&keyOf(S.current)===keyOf(city));
+    let d;
+    try{d=await overpassQuery('[out:json][timeout:45];('+parts+');out center 900;',60000,S.current&&keyOf(S.current)===keyOf(city))}
+    catch(e){continue}
+    answered++;
     (d.elements||[]).forEach(el=>{
       const lat=el.lat!=null?el.lat:(el.center?el.center.lat:null);
       const lon=el.lon!=null?el.lon:(el.center?el.center.lon:null);
@@ -724,8 +761,10 @@ async function fetchGeomRaw(city,cat){
       pts.push({lon:lon,lat:lat,name:t.name||null,kind:t.amenity||t.shop||t.leisure||t.highway||t.building||t.landuse||t.railway||''});
     });
   }
+  if(!answered)throw new Error('overpass: no tile answered');
   const sliced=pts.slice(0,6000);
-  if(sliced.length)cacheSet('geom',ck,sliced);
+  if(answered<boxes.length)sliced._partial=true;
+  else if(sliced.length)cacheSet('geom',ck,sliced);
   return sliced;
 }
 async function resolvePlace(lat,lon){
@@ -818,6 +857,15 @@ function initMap(){
   map.on('move',()=>{mini.jumpTo({center:map.getCenter(),zoom:Math.max(0.2,map.getZoom()-4.6)})});
   map.on('load',()=>{addHexLayers();PRESETS.forEach(p=>addPin(cities.get(keyOf(p))))});
   map.on('style.load',()=>{if(S.drill>=1)addHexLayers(),drawHexes()});
+  map.on('styledata',()=>{
+    // the self-heal beat described at ensureHexLayers: when a basemap
+    // rebuild settles and the hex stack is found missing, rebuild it and
+    // repaint from state (the signature reset makes render repaint too)
+    if(S.drill<1)return;
+    let healed=false;
+    try{healed=ensureHexLayers()}catch(e){}
+    if(healed){S._hexSig=null;drawHexes()}
+  });
   map.on('zoomend',()=>{if(S.drill===1&&!S.flying&&map.getZoom()<9.0)digUp()});
   map.on('click','hexfill',e=>{if(e.features&&e.features.length)selectHex(e.features[0].properties.id)});
 }
@@ -865,13 +913,46 @@ function buildHexes(city){
   }
   return{type:'FeatureCollection',features:feats,R};
 }
+function hexPaint(){
+  // paint tuned per basemap: the dark values (near-white grid lines, a
+  // whisper of fill on empty cells, a white selection outline) sit at
+  // almost exactly the light basemap's own land color, so on the light
+  // style the grid reads as absent even when it renders
+  return S.styleDark?{
+    line:'rgba(233,230,220,0.30)',sel:'#ffffff',zero:'rgba(110,130,150,0.07)'
+  }:{
+    line:'rgba(23,34,46,0.38)',sel:'#0e2a3a',zero:'rgba(70,95,120,0.10)'
+  };
+}
+function hexFillRamp(P){return['interpolate',['linear'],['get','count'],0,P.zero,1,'#3d6a8a',6,'#7fb069',14,'#e8c547']}
 function addHexLayers(){
-  if(!map.getSource('hexes')){
-    map.addSource('hexes',{type:'geojson',data:{type:'FeatureCollection',features:[]}});
-    map.addLayer({id:'hexfill',type:'fill',source:'hexes',paint:{'fill-color':['interpolate',['linear'],['get','count'],0,'rgba(110,130,150,0.07)',1,'#3d6a8a',6,'#7fb069',14,'#e8c547'],'fill-opacity':0.6}});
-    map.addLayer({id:'hexline',type:'line',source:'hexes',paint:{'line-color':'rgba(233,230,220,0.30)','line-width':1}});
-    map.addLayer({id:'hexsel',type:'line',source:'hexes',filter:['==',['get','id'],-1],paint:{'line-color':'#ffffff','line-width':2}});
-  }
+  if(!map||!map.getStyle())return;
+  const P=hexPaint();
+  if(!map.getSource('hexes'))map.addSource('hexes',{type:'geojson',data:{type:'FeatureCollection',features:[]}});
+  if(!map.getLayer('hexfill'))map.addLayer({id:'hexfill',type:'fill',source:'hexes',paint:{'fill-color':hexFillRamp(P),'fill-opacity':0.6}});
+  if(!map.getLayer('hexline'))map.addLayer({id:'hexline',type:'line',source:'hexes',paint:{'line-color':P.line,'line-width':1}});
+  if(!map.getLayer('hexsel'))map.addLayer({id:'hexsel',type:'line',source:'hexes',filter:['==',['get','id'],-1],paint:{'line-color':P.sel,'line-width':2}});
+}
+function applyHexTheme(){
+  if(!map||!map.getStyle())return;
+  const P=hexPaint();
+  if(map.getLayer('hexfill'))map.setPaintProperty('hexfill','fill-color',hexFillRamp(P));
+  if(map.getLayer('hexline'))map.setPaintProperty('hexline','line-color',P.line);
+  if(map.getLayer('hexsel'))map.setPaintProperty('hexsel','line-color',P.sel);
+}
+function ensureHexLayers(){
+  // The hex layer stack does not survive a basemap switch on its own:
+  // setStyle drops layers the new style does not define, and the rebuild
+  // can land after style.load has already fired, wiping what the handler
+  // just re-added (Nov 22: on the light basemap the hexes vanished
+  // entirely, fills and outlines, until the switch back). No single
+  // event is trustworthy, so the stack is checked and rebuilt wherever
+  // it is needed: every draw, and every styledata beat that finds it
+  // missing. Returns true when it had to rebuild.
+  if(!map||!map.getStyle())return false;
+  if(map.getSource('hexes')&&map.getLayer('hexfill')&&map.getLayer('hexline')&&map.getLayer('hexsel'))return false;
+  addHexLayers();
+  return true;
 }
 async function drawHexes(){
   if(!map)return;
@@ -886,6 +967,10 @@ async function drawHexes(){
   // notice (the overview signature below watches all six categories, and
   // this call makes the seeding itself unconditional on draw)
   if(window.ABUNDANCE_GEOM)seedGeom(city);
+  // the layer stack must exist before any paint: a basemap switch can
+  // leave it missing (see addHexLayers), and every draw self-heals it
+  // instead of trusting that an earlier event re-added it
+  ensureHexLayers();
   // generation guard: overlapping draws (selectCity fires two, a lens change
   // a third) must not let an older draw's late geometry overwrite the grid
   // the panel reads, or the map and the panel end up describing different
@@ -927,7 +1012,7 @@ async function drawHexes(){
     };
     paintOv();
     for(const c of CATS){
-      if(city.geom[c.id])continue;
+      if(city.geom[c.id]&&!(city._geomPartial&&city._geomPartial[c.id]))continue;
       city.geomState[c.id]='loading';
       paintOv();
       try{city.geom[c.id]=await fetchGeom(city,c);city.geomState[c.id]='ok'}
@@ -945,11 +1030,16 @@ async function drawHexes(){
     });
     return;
   }
-  if(!city.geom[catId]){
+  if(!city.geom[catId]||(city._geomPartial&&city._geomPartial[catId])){
+    // missing entirely, or present but partial (some map tiles never
+    // answered): ask again; a failed re-ask keeps the partial points
     city.geomState[catId]='loading';
     if(S.drill===2&&S.selHex!=null)fillHexPanel();
     try{city.geom[catId]=await fetchGeom(city,cat);city.geomState[catId]='ok'}
-    catch(e){city.geomState[catId]='fail';toast('Hex site data unavailable for '+cat.name+'. Tap a cell to retry.');if(S.current===city)scheduleCountsRetry(city)}
+    catch(e){
+      if(city.geom[catId])city.geomState[catId]='ok';
+      else{city.geomState[catId]='fail';toast('Hex site data unavailable for '+cat.name+'. Tap a cell to retry.');if(S.current===city)scheduleCountsRetry(city)}
+    }
   }
   if(S.current!==city||S.hexCat!==catId||city._hexGen!==gen)return;
   const feats=grid.features;
@@ -1129,11 +1219,11 @@ function scheduleCountsRetry(city){
     // the snapshot, a failed site fetch is the ONLY missing piece, and
     // without it in this condition the chain never started and the
     // failure was never retried in the background at all.
-    const missing=()=>CATS.some(c=>!city.counts||city.counts[c.id]==null)||!city.acs||(S.current===city&&!city.wx)||(S.current===city&&(city.geomState[S.hexCat]==='fail'||(S.hexCat==='overview'&&CATS.some(c=>city.geomState[c.id]==='fail'&&!city.geom[c.id]))));
+    const missing=()=>CATS.some(c=>!city.counts||city.counts[c.id]==null)||!city.acs||(S.current===city&&!city.wx)||(S.current===city&&city._geomPartial&&Object.keys(city._geomPartial).length>0)||(S.current===city&&(city.geomState[S.hexCat]==='fail'||(S.hexCat==='overview'&&CATS.some(c=>city.geomState[c.id]==='fail'&&!city.geom[c.id]))));
     if(!missing()){city._retryN=null;return}
     if(S.current===city&&S.drill>=1){
       await loadCityData(city).catch(()=>{});
-      if(city.geomState[S.hexCat]==='fail'||(S.hexCat==='overview'&&CATS.some(c=>city.geomState[c.id]==='fail'&&!city.geom[c.id])))drawHexes();
+      if(city.geomState[S.hexCat]==='fail'||(city._geomPartial&&Object.keys(city._geomPartial).length)||(S.hexCat==='overview'&&CATS.some(c=>city.geomState[c.id]==='fail'&&!city.geom[c.id])))drawHexes();
       commit();
       if(!missing()){
         toast(city.name+' ready',1400);city._retryN=null;return;
@@ -1258,11 +1348,51 @@ $('q').addEventListener('input',e=>{
   searchTimer=setTimeout(async()=>{
     try{
       const d=await fetchJSON('https://geocoding-api.open-meteo.com/v1/search?name='+encodeURIComponent(q)+'&count=8&language=en&format=json',12000);
-      const rs=(d.results||[]).filter(r=>r.country_code==='US');
-      box.innerHTML='';if(!rs.length){box.style.display='none';return}
+      let rs=(d.results||[]).filter(r=>r.country_code==='US');
+      // a slow earlier query must not paint its results over the text
+      // now sitting in the box
+      if($('q').value.trim()!==q)return;
+      if(!rs.length){
+        // The primary gazetteer knows places only by their formal
+        // names: "Philly" returns nothing at all from it (verified
+        // Nov 22), and the old handler answered that silence by hiding
+        // the dropdown, so the search looked dead. OpenStreetMap's
+        // geocoder indexes the names people actually use; ask it
+        // before giving up. Its results carry no population: the box
+        // starts at the default size, then Census lands in load phase 1
+        // (before counts and geometry read the box) and the hex
+        // signature carries the Census population, so the field is
+        // rebuilt at the true size when it arrives.
+        try{
+          const nd=await fetchJSON('https://nominatim.openstreetmap.org/search?q='+encodeURIComponent(q)+', USA&format=jsonv2&limit=8&addressdetails=1&countrycodes=us',12000);
+          const seen=new Set();
+          (nd||[]).forEach(r=>{
+            const a=r.address||{};
+            const nm=a.city||a.town||a.village||a.borough||a.hamlet||'';
+            const st=a.state||'';
+            if(!nm||!STATE_CODES[st]||seen.has(nm+'|'+st))return;
+            seen.add(nm+'|'+st);
+            rs.push({name:nm,admin1:st,latitude:parseFloat(r.lat),longitude:parseFloat(r.lon),population:null});
+          });
+        }catch(e){}
+        if($('q').value.trim()!==q)return;
+      }
+      box.innerHTML='';
+      if(!rs.length){
+        // say so, in the open: a search that found nothing must look
+        // different from a search that never ran
+        const div=document.createElement('div');
+        div.style.cursor='default';
+        div.textContent='No US city found for "'+q+'" ';
+        const sp=document.createElement('span');sp.textContent='try the full city name';
+        div.appendChild(sp);
+        box.appendChild(div);
+        box.style.display='block';
+        return;
+      }
       rs.forEach(r=>{
         const div=document.createElement('div');div.innerHTML=r.name+' <span>'+(r.admin1||'')+'</span>';
-        div.addEventListener('click',async()=>{
+        div.addEventListener('click',()=>{
           box.style.display='none';$('q').value=r.name;
           // Reuse the city that already exists under this key. The old
           // handler built a brand-new blank city on every tap and stored
@@ -1277,11 +1407,11 @@ $('q').addEventListener('input',e=>{
             city.wageDef=WAGES[city.code]||7.25;
             cities.set(keyOf(city),city);
             seedCity(city);
-            toast('Resolving Census place for '+r.name+'...');
-            const pl=await resolvePlace(r.latitude,r.longitude);
-            if(pl)city.geoid=pl.geoid;
-            else toast('No Census place found for '+r.name+'; its Census figures will be unavailable.',3600);
           }
+          // No Census pre-resolve on the tap: loadCityData owns
+          // resolution and retries it on every load. Awaiting a slow
+          // resolver here first (two layers, up to 15 s each) made the
+          // tap itself look dead.
           selectCity(city,{fly:true});
         });
         box.appendChild(div);
@@ -1348,15 +1478,25 @@ document.addEventListener('keydown',e=>{
   const home=cities.get(keyOf(PRESETS[0]));
   let homeReady=Promise.resolve();
   if(home&&!S.current)homeReady=selectCity(home,{fly:true});
-  // fast pass: ACS + weather + air for all reference cities
-  await Promise.allSettled(PRESETS.map(async p=>{
-    const c=cities.get(keyOf(p));
-    await Promise.allSettled([
-      fetchACS(c).then(a=>{c.acs=a}).catch(()=>{}),
-      fetchWX(c).then(w=>{c.wx=w;c._wxT=Date.now()}).catch(()=>{}),
-      fetchAQ(c).then(a=>{c.aq=a;c._aqT=Date.now()}).catch(()=>{})
-    ]);
-    commit();
+  // fast pass: ACS + weather + air for all reference cities, four at a
+  // time. Firing all 15 cities at once burst each host at the exact
+  // moment the page opened; three consecutive failures open the polite
+  // client's circuit breaker for a minute or more, and the blackout
+  // then swallows the same host for the city the user actually opens
+  // (the likely shape of Nov 22's missing live weather on searched
+  // cities, while air quality, a different host with its own breaker,
+  // loaded fine).
+  const fq=PRESETS.slice();
+  await Promise.all([0,1,2,3].map(async()=>{
+    while(fq.length){
+      const p=fq.shift();const c=cities.get(keyOf(p));
+      await Promise.allSettled([
+        fetchACS(c).then(a=>{c.acs=a}).catch(()=>{}),
+        fetchWX(c).then(w=>{c.wx=w;c._wxT=Date.now()}).catch(()=>{}),
+        fetchAQ(c).then(a=>{c.aq=a;c._aqT=Date.now()}).catch(()=>{})
+      ]);
+      commit();
+    }
   }));
   commit();
   // the background board waits until the home city has had the data services to
