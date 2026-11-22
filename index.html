@@ -759,6 +759,27 @@ async function fetchGeom(city,cat,shouldStop){
     return pts;
   }finally{delete city._fg[cat.id]}
 }
+function applyGeom(city,catId,pts){
+  // Geometry obeys the same never-go-backwards rule as the counts: a
+  // partial re-ask (some tiles or tags never answered) MERGES into the
+  // points already on hand instead of replacing them, because a
+  // replacement made the field flicker, full one minute and empty the
+  // next, as each re-ask returned whichever subset answered that time
+  // (Philadelphia Food, Nov 22). Only a complete result replaces the
+  // set wholesale, as the fresher full picture.
+  if(!pts)return;
+  const cur=city.geom[catId];
+  if(pts._partial&&cur&&cur.length){
+    const key=p=>[p.lon,p.lat,p.kind||'',p.name||''].join('|');
+    const seen=new Set(cur.map(key));
+    const merged=cur.slice();
+    pts.forEach(p=>{const k=key(p);if(!seen.has(k)){seen.add(k);merged.push(p)}});
+    city.geom[catId]=merged;
+  }else{
+    city.geom[catId]=pts;
+  }
+  city.geomState[catId]='ok';
+}
 async function fetchGeomRaw(city,cat,shouldStop){
   const ck=keyOf(city)+':'+cat.id;
   const hitGeom=cacheGet('geom',ck);if(hitGeom)return hitGeom;
@@ -1110,7 +1131,7 @@ async function drawHexes(){
     todoCats.forEach(c=>{city.geomState[c.id]='loading'});
     if(todoCats.length)paintOv();
     await Promise.allSettled(todoCats.map(async c=>{
-      try{city.geom[c.id]=await fetchGeom(city,c,stale);city.geomState[c.id]='ok'}
+      try{applyGeom(city,c.id,await fetchGeom(city,c,stale))}
       catch(e){
         if(stale())return;
         // a late failure must not stamp the category failed over
@@ -1126,17 +1147,41 @@ async function drawHexes(){
     CATS.forEach(c=>{
       if(city.geomFrom&&city.geomFrom[c.id]==='snapshot'&&!city._ovBg.has(c.id)){
         city._ovBg.add(c.id);
-        fetchGeom(city,c).then(pts=>{if(pts&&pts.length){city.geom[c.id]=pts;city.geomFrom[c.id]='live';city.geomState[c.id]='ok';if(S.current===city&&S.hexCat==='overview')drawHexes()}}).catch(()=>{});
+        fetchGeom(city,c).then(pts=>{if(pts&&pts.length){applyGeom(city,c.id,pts);city.geomFrom[c.id]='live';if(S.current===city&&S.hexCat==='overview')drawHexes()}}).catch(()=>{});
       }
     });
     return;
   }
-  if(!city.geom[catId]||(city._geomPartial&&city._geomPartial[catId])){
-    // missing entirely, or present but partial (some map tiles never
-    // answered): ask again; a failed re-ask keeps the partial points
-    city.geomState[catId]='loading';
+  // Paint what is already on hand FIRST, then fetch. This view used to
+  // blank the field to bare outlines for the whole length of a re-ask
+  // (a partial set is re-asked on every draw), so the field read as
+  // empty for minutes at a time even though its points were already in
+  // memory, and any look taken mid-re-ask showed a dead map.
+  const mLatS=111320;
+  const paintCat=()=>{
+    grid.features.forEach(f=>{f.properties.count=0;f._pts=null});
+    const ptsNow=city.geom[catId]||[];
+    ptsNow.forEach(p=>{
+      let best=null,bd=1e18;
+      grid.features.forEach(f=>{
+        const ddx=(f.properties.cx-p.lon)*mLatS*Math.cos(p.lat*Math.PI/180),ddy=(f.properties.cy-p.lat)*mLatS;
+        const d=ddx*ddx+ddy*ddy;if(d<bd){bd=d;best=f}
+      });
+      if(best&&bd<(grid.R*1.1)*(grid.R*1.1)){best.properties.count++;(best._pts=best._pts||[]).push(p)}
+    });
+    const src=map.getSource('hexes');if(src)src.setData(grid);
+    if(ptsNow.length&&city.geomState[catId]!=='loading')city.geomState[catId]='ok';
+    if(leg)leg.textContent=cat.name.toUpperCase()+' PER HEX'+(city.geomState[catId]==='fail'?' · UNAVAILABLE':(city.geomState[catId]==='loading'?' · LOADING':''));
     if(S.drill===2&&S.selHex!=null)fillHexPanel();
-    try{city.geom[catId]=await fetchGeom(city,cat,stale);city.geomState[catId]='ok'}
+  };
+  const needFetch=!city.geom[catId]||(city._geomPartial&&city._geomPartial[catId]);
+  if(needFetch)city.geomState[catId]='loading';
+  paintCat();
+  if(needFetch){
+    // missing entirely, or present but partial (some map tiles or tags
+    // never answered): ask again; a failed re-ask keeps the points
+    // already painted
+    try{applyGeom(city,catId,await fetchGeom(city,cat,stale))}
     catch(e){
       // an abandoned draw (the visitor moved to another city or lens
       // while this fetch was in flight) stamps nothing, toasts
@@ -1155,30 +1200,9 @@ async function drawHexes(){
         if(S.current===city)scheduleCountsRetry(city);
       }
     }
+    if(S.current!==city||S.hexCat!==catId||city._hexGen!==gen)return;
+    paintCat();
   }
-  if(S.current!==city||S.hexCat!==catId||city._hexGen!==gen)return;
-  const feats=grid.features;
-  const mLat=111320;
-  const pts=city.geom[catId]||[];
-  pts.forEach(p=>{
-    let best=null,bd=1e18;
-    feats.forEach(f=>{
-      const ddx=(f.properties.cx-p.lon)*mLat*Math.cos(p.lat*Math.PI/180),ddy=(f.properties.cy-p.lat)*mLat;
-      const d=ddx*ddx+ddy*ddy;if(d<bd){bd=d;best=f}
-    });
-    if(best&&bd<(grid.R*1.1)*(grid.R*1.1)){best.properties.count++;(best._pts=best._pts||[]).push(p)}
-  });
-  const src=map.getSource('hexes');if(src)src.setData(grid);
-  // points on the map outrank a stale state stamp: a background fetch
-  // that failed after the bundle seeded this category used to leave
-  // the legend reading UNAVAILABLE over a field that had just painted
-  if(pts.length){
-    city.geomState[catId]='ok';
-    const hnS=$('hexnote');
-    if(hnS&&hnS.textContent.indexOf('Hex site data unavailable')===0)hnS.textContent='';
-  }
-  if(leg)leg.textContent=cat.name.toUpperCase()+' PER HEX'+(city.geomState[catId]==='fail'?' · UNAVAILABLE':'');
-  if(S.drill===2&&S.selHex!=null)fillHexPanel();
 }
 /* ================= ASSEMBLY 4 + 3: DOSSIER AND DRILL STACK ================= */
 const HOURS=173.33;
@@ -1312,7 +1336,7 @@ async function loadCityData(city){
     // one live fetch in the background replaces them if it lands
     const hcat=CATS.find(c=>c.id===S.hexCat);
     if(hcat&&city.geomFrom[hcat.id]==='snapshot'){
-      fetchGeom(city,hcat).then(g=>{if(g&&g.length&&S.current===city){city.geom[hcat.id]=g;city.geomFrom[hcat.id]='live';commit()}}).catch(()=>{});
+      fetchGeom(city,hcat).then(g=>{if(g&&g.length&&S.current===city){applyGeom(city,hcat.id,g);city.geomFrom[hcat.id]='live';commit()}}).catch(()=>{});
     }
   }
 }
