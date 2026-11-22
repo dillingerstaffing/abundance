@@ -388,7 +388,12 @@ async function fetchJSON(url,ms){
   try{
     const r=await fetch(url,{signal:ctl.signal});
     if(!r.ok){
-      if(r.status===429||r.status===503){const ra=parseInt(r.headers.get('Retry-After')||'',10);hostFail(host,isNaN(ra)?null:ra)}
+      // a 429 with no Retry-After gets a 30-minute cooling-off, not the
+      // short breaker: the forecast API's 429 is a DAILY quota ("Daily
+      // API request limit exceeded. Please try again tomorrow."), and
+      // re-asking every few minutes all session both burns the quota
+      // further and never succeeds
+      if(r.status===429||r.status===503){const ra=parseInt(r.headers.get('Retry-After')||'',10);hostFail(host,isNaN(ra)?(r.status===429?1800:null):ra)}
       else hostFail(host,null);
       throw new Error('HTTP '+r.status);
     }
@@ -453,9 +458,20 @@ async function fetchACS(city){
   return out;
 }
 async function fetchWX(city){
+  // Weather is cached on the device for an hour: it barely moves in
+  // that window, and the free forecast API enforces a daily request
+  // quota per network address (observed Nov 22: HTTP 429, daily limit
+  // exceeded, for every city, all session long). Only the open city's
+  // weather is ever displayed, so it is the only one fetched at all
+  // (the boot pass used to fetch all 15, burning the day's quota on
+  // figures nobody sees).
+  const hit=cacheGet('wx',keyOf(city));
+  if(hit&&hit.t&&Date.now()-hit.t<3600000)return hit.v;
   const u='https://api.open-meteo.com/v1/forecast?latitude='+city.lat+'&longitude='+city.lon+'&current=temperature_2m,wind_speed_10m,shortwave_radiation,weather_code&timezone=auto';
   const d=await fetchJSON(u,15000);
-  return{temp:d.current.temperature_2m,wind:d.current.wind_speed_10m,solar:d.current.shortwave_radiation,utcOff:d.utc_offset_seconds};
+  const out={temp:d.current.temperature_2m,wind:d.current.wind_speed_10m,solar:d.current.shortwave_radiation,utcOff:d.utc_offset_seconds};
+  cacheSet('wx',keyOf(city),{t:Date.now(),v:out});
+  return out;
 }
 async function fetchAQ(city){
   const u='https://air-quality-api.open-meteo.com/v1/air-quality?latitude='+city.lat+'&longitude='+city.lon+'&current=us_aqi,pm2_5';
@@ -682,7 +698,7 @@ async function overpassQueryRaw(ql,timeoutMs){
       const r=await fetch(ep,{method:'POST',signal:ctl.signal,headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'data='+encodeURIComponent(ql)});
       clearTimeout(h);
       if(!r.ok){
-        if(r.status===429||r.status===503){const ra=parseInt(r.headers.get('Retry-After')||'',10);hostFail(host,isNaN(ra)?null:ra)}
+        if(r.status===429||r.status===503){const ra=parseInt(r.headers.get('Retry-After')||'',10);hostFail(host,isNaN(ra)?(r.status===429?1800:null):ra)}
         else hostFail(host,null);
         throw new Error('HTTP '+r.status);
       }
@@ -736,21 +752,26 @@ async function fetchGeomRaw(city,cat){
     const mLat=(b.s+b.n)/2,mLon=(b.w+b.e)/2;
     boxes.push([b.s,b.w,mLat,mLon],[b.s,mLon,mLat,b.e],[mLat,b.w,b.n,mLon],[mLat,mLon,b.n,b.e]);
   }else boxes.push([b.s,b.w,b.n,b.e]);
-  const seen=new Set(),pts=[];
   // tiles fail independently: one dead quadrant must not discard the
   // points the other three returned (until Nov 22 a single failed tile
   // rejected the whole category, which is why big searched cities showed
   // empty hex fields while small ones filled). The category fails only
   // when NO tile answers. A partial merge is returned uncached and
   // flagged, so it paints now and is re-asked later instead of posing
-  // as the complete picture for a day.
-  let answered=0;
-  for(const q of boxes){
+  // as the complete picture for a day. The tiles also run concurrently:
+  // the Overpass gate already paces the service to two queries at a
+  // time, so awaiting the quadrants one by one only serialized the
+  // wait without sparing the service anything.
+  const perTile=await Promise.all(boxes.map(async q=>{
     const bbox=q[0]+','+q[1]+','+q[2]+','+q[3];
     const parts=OVERPASS_Q[cat.id].map(t=>'nwr'+t+'('+bbox+');').join('');
-    let d;
-    try{d=await overpassQuery('[out:json][timeout:45];('+parts+');out center 900;',60000,S.current&&keyOf(S.current)===keyOf(city))}
-    catch(e){continue}
+    try{return await overpassQuery('[out:json][timeout:45];('+parts+');out center 900;',60000,S.current&&keyOf(S.current)===keyOf(city))}
+    catch(e){return null}
+  }));
+  const seen=new Set(),pts=[];
+  let answered=0;
+  perTile.forEach(d=>{
+    if(!d)return;
     answered++;
     (d.elements||[]).forEach(el=>{
       const lat=el.lat!=null?el.lat:(el.center?el.center.lat:null);
@@ -760,7 +781,7 @@ async function fetchGeomRaw(city,cat){
       const t=el.tags||{};
       pts.push({lon:lon,lat:lat,name:t.name||null,kind:t.amenity||t.shop||t.leisure||t.highway||t.building||t.landuse||t.railway||''});
     });
-  }
+  });
   if(!answered)throw new Error('overpass: no tile answered');
   const sliced=pts.slice(0,6000);
   if(answered<boxes.length)sliced._partial=true;
@@ -1011,15 +1032,26 @@ async function drawHexes(){
       if(S.drill===2&&S.selHex!=null)fillHexPanel();
     };
     paintOv();
-    for(const c of CATS){
-      if(city.geom[c.id]&&!(city._geomPartial&&city._geomPartial[c.id]))continue;
-      city.geomState[c.id]='loading';
-      paintOv();
+    // Categories fetch concurrently, each painting as it lands: the
+    // Overpass gate already paces the service to two queries at a time,
+    // so the old one-after-another loop only serialized the waiting,
+    // and a slow first category (a big city's housing tiles) held every
+    // other category's colors hostage for minutes (Philadelphia showed
+    // outlines only for a full three minutes, Nov 22).
+    const todoCats=CATS.filter(c=>!(city.geom[c.id]&&!(city._geomPartial&&city._geomPartial[c.id])));
+    todoCats.forEach(c=>{city.geomState[c.id]='loading'});
+    if(todoCats.length)paintOv();
+    await Promise.allSettled(todoCats.map(async c=>{
       try{city.geom[c.id]=await fetchGeom(city,c);city.geomState[c.id]='ok'}
-      catch(e){city.geomState[c.id]='fail'}
+      catch(e){
+        // a late failure must not stamp the category failed over
+        // points already on hand (bundle or cache): the state
+        // describes what the map can show, and it can show those
+        city.geomState[c.id]=city.geom[c.id]?'ok':'fail';
+      }
       if(S.current!==city||S.hexCat!==catId||city._hexGen!==gen)return;
       paintOv();
-    }
+    }));
     // snapshot-sourced points refresh live in the background, once each
     city._ovBg=city._ovBg||new Set();
     CATS.forEach(c=>{
@@ -1054,6 +1086,10 @@ async function drawHexes(){
     if(best&&bd<(grid.R*1.1)*(grid.R*1.1)){best.properties.count++;(best._pts=best._pts||[]).push(p)}
   });
   const src=map.getSource('hexes');if(src)src.setData(grid);
+  // points on the map outrank a stale state stamp: a background fetch
+  // that failed after the bundle seeded this category used to leave
+  // the legend reading UNAVAILABLE over a field that had just painted
+  if(pts.length)city.geomState[catId]='ok';
   if(leg)leg.textContent=cat.name.toUpperCase()+' PER HEX'+(city.geomState[catId]==='fail'?' · UNAVAILABLE':'');
   if(S.drill===2&&S.selHex!=null)fillHexPanel();
 }
@@ -1478,7 +1514,8 @@ document.addEventListener('keydown',e=>{
   const home=cities.get(keyOf(PRESETS[0]));
   let homeReady=Promise.resolve();
   if(home&&!S.current)homeReady=selectCity(home,{fly:true});
-  // fast pass: ACS + weather + air for all reference cities, four at a
+  // fast pass: ACS + air for all reference cities (weather is fetched
+  // per open city only; see fetchWX), four at a
   // time. Firing all 15 cities at once burst each host at the exact
   // moment the page opened; three consecutive failures open the polite
   // client's circuit breaker for a minute or more, and the blackout
@@ -1492,7 +1529,6 @@ document.addEventListener('keydown',e=>{
       const p=fq.shift();const c=cities.get(keyOf(p));
       await Promise.allSettled([
         fetchACS(c).then(a=>{c.acs=a}).catch(()=>{}),
-        fetchWX(c).then(w=>{c.wx=w;c._wxT=Date.now()}).catch(()=>{}),
         fetchAQ(c).then(a=>{c.aq=a;c._aqT=Date.now()}).catch(()=>{})
       ]);
       commit();
