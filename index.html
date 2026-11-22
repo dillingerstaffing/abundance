@@ -789,8 +789,9 @@ async function fetchGeomRaw(city,cat,shouldStop){
   // wait without sparing the service anything.
   const perTile=await Promise.all(boxes.map(async q=>{
     const bbox=q[0]+','+q[1]+','+q[2]+','+q[3];
-    const parts=OVERPASS_Q[cat.id].map(t=>'nwr'+t+'('+bbox+');').join('');
-    try{
+    const tags=OVERPASS_Q[cat.id];
+    const ask=async ts=>{
+      const parts=ts.map(t=>'nwr'+t+'('+bbox+');').join('');
       const d=await overpassQuery('[out:json][timeout:45];('+parts+');out center 900;',50000,S.current&&keyOf(S.current)===keyOf(city),shouldStop);
       // the server gives up on a heavy tile at its own 45 s limit and
       // says so in a remark on an otherwise successful reply: that is
@@ -798,15 +799,34 @@ async function fetchGeomRaw(city,cat,shouldStop){
       // answer would paint missing ground as surveyed ground
       if(d&&d.remark&&/timed out/i.test(d.remark))throw new Error('tile timed out');
       return d;
+    };
+    try{return{data:await ask(tags),partial:false}}
+    catch(e){
+      if(!(e&&(e.name==='AbortError'||e.message==='tile timed out')))return null;
+      // A tile the service cannot finish whole is asked once more, tag
+      // by tag. One heavy selector (every grocery store in a metro
+      // quadrant is the standing example) then times out alone instead
+      // of taking the tile's supermarkets and markets down with it,
+      // and whatever answers still paints, flagged partial so the
+      // missing tag is re-asked later. Only a timeout earns the split:
+      // an outage is not retried threefold against a struggling fleet.
+      const els=[];let answeredParts=0;
+      for(const t of tags){
+        if(shouldStop&&shouldStop())break;
+        try{const d=await ask([t]);answeredParts++;(d.elements||[]).forEach(el=>els.push(el))}
+        catch(e2){}
+      }
+      if(!answeredParts)return null;
+      return{data:{elements:els},partial:true};
     }
-    catch(e){return null}
   }));
   const seen=new Set(),pts=[];
-  let answered=0;
-  perTile.forEach(d=>{
-    if(!d)return;
+  let answered=0,tilePartial=false;
+  perTile.forEach(entry=>{
+    if(!entry)return;
     answered++;
-    (d.elements||[]).forEach(el=>{
+    if(entry.partial)tilePartial=true;
+    (entry.data.elements||[]).forEach(el=>{
       const lat=el.lat!=null?el.lat:(el.center?el.center.lat:null);
       const lon=el.lon!=null?el.lon:(el.center?el.center.lon:null);
       if(lat==null||lon==null)return;
@@ -817,7 +837,7 @@ async function fetchGeomRaw(city,cat,shouldStop){
   });
   if(!answered)throw new Error('overpass: no tile answered');
   const sliced=pts.slice(0,6000);
-  if(answered<boxes.length)sliced._partial=true;
+  if(answered<boxes.length||tilePartial)sliced._partial=true;
   else if(sliced.length)cacheSet('geom',ck,sliced);
   return sliced;
 }
@@ -1116,10 +1136,24 @@ async function drawHexes(){
     // answered): ask again; a failed re-ask keeps the partial points
     city.geomState[catId]='loading';
     if(S.drill===2&&S.selHex!=null)fillHexPanel();
-    try{city.geom[catId]=await fetchGeom(city,cat);city.geomState[catId]='ok'}
+    try{city.geom[catId]=await fetchGeom(city,cat,stale);city.geomState[catId]='ok'}
     catch(e){
+      // an abandoned draw (the visitor moved to another city or lens
+      // while this fetch was in flight) stamps nothing, toasts
+      // nothing, and schedules nothing: its failure belongs to a view
+      // nobody is looking at
+      if(stale())return;
       if(city.geom[catId])city.geomState[catId]='ok';
-      else{city.geomState[catId]='fail';toast('Hex site data unavailable for '+cat.name+'. Tap a cell to retry.');if(S.current===city)scheduleCountsRetry(city)}
+      else{
+        city.geomState[catId]='fail';
+        // the failure is announced once per city and category, not on
+        // every retry cycle: the legend already carries the standing
+        // UNAVAILABLE state, and a toast re-firing every few minutes
+        // reads as a stuck note on the page
+        city._failToasted=city._failToasted||{};
+        if(!city._failToasted[catId]){city._failToasted[catId]=1;toast('Hex site data unavailable for '+cat.name+'. Tap a cell to retry.')}
+        if(S.current===city)scheduleCountsRetry(city);
+      }
     }
   }
   if(S.current!==city||S.hexCat!==catId||city._hexGen!==gen)return;
