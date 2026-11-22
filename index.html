@@ -670,13 +670,20 @@ const OVERPASS_Q={
   health:['["amenity"~"^(hospital|clinic|pharmacy|doctors|dentist)$"]'],
   air:['["leisure"~"^(park|nature_reserve)$"]']
 };
-async function overpassQuery(ql,timeoutMs,prio){
+async function overpassQuery(ql,timeoutMs,prio,shouldStop){
   // Overpass instances allow about two concurrent heavy queries per IP; a burst
   // of parallel calls queues, times out, and retries the next endpoint, which is
   // how the hex data starved. Run at most two at a time, and let the open city's
   // requests jump the queue: background cities wait, the city on screen does not.
+  // shouldStop lets a superseded draw (the visitor moved to another city
+  // or lens) abandon its queued and rotating queries instead of holding
+  // the two slots for minutes on work nobody is looking at, which is
+  // what starved the next city's hexes (Atlantic City Food, Nov 22).
   await ovpAcquire(prio);
-  try{return await overpassQueryRaw(ql,timeoutMs)}finally{ovpRelease()}
+  try{
+    if(shouldStop&&shouldStop())throw new Error('stale draw');
+    return await overpassQueryRaw(ql,timeoutMs,shouldStop);
+  }finally{ovpRelease()}
 }
 let _ovpActive=0;const _ovpQ=[],_ovpQP=[];
 function ovpAcquire(prio){
@@ -687,10 +694,19 @@ function ovpRelease(){
   const next=_ovpQP.shift()||_ovpQ.shift();
   if(next)next();else _ovpActive--;
 }
-async function overpassQueryRaw(ql,timeoutMs){
+let _ovpRot=0;
+async function overpassQueryRaw(ql,timeoutMs,shouldStop){
   const eps=['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter','https://overpass.nchc.org.tw/api/interpreter','https://overpass.private.coffee/api/interpreter'];
   let lastErr=null;
-  for(const ep of eps){
+  // rotate the starting instance per query: always leading with the
+  // same public instance meant one slow instance taxed every query in
+  // turn, each tile paying a full timeout before rotating on. Spreading
+  // first attempts across all four instances is fairer to the
+  // volunteers running them and faster for the map.
+  const startAt=(_ovpRot++)%eps.length;
+  for(let i=0;i<eps.length;i++){
+    if(shouldStop&&shouldStop())throw new Error('stale draw');
+    const ep=eps[(startAt+i)%eps.length];
     const host=new URL(ep).hostname;
     try{
       hostGate(host);
@@ -720,12 +736,12 @@ async function overpassCounts(city,cats){
   cats.forEach((cat,i)=>{const el=els[i];if(!el.tags||el.tags.total==null)throw new Error('no count in overpass reply');out[cat.id]=parseInt(el.tags.total,10)});
   return out;
 }
-async function fetchGeom(city,cat){
+async function fetchGeom(city,cat,shouldStop){
   // one network fetch per city and category at a time: overlapping draws
   // share the same promise instead of racing separate requests
   city._fg=city._fg||{};
   if(city._fg[cat.id])return city._fg[cat.id];
-  const p=fetchGeomRaw(city,cat);
+  const p=fetchGeomRaw(city,cat,shouldStop);
   city._fg[cat.id]=p;
   try{
     const pts=await p;
@@ -736,9 +752,10 @@ async function fetchGeom(city,cat){
     return pts;
   }finally{delete city._fg[cat.id]}
 }
-async function fetchGeomRaw(city,cat){
+async function fetchGeomRaw(city,cat,shouldStop){
   const ck=keyOf(city)+':'+cat.id;
   const hitGeom=cacheGet('geom',ck);if(hitGeom)return hitGeom;
+  if(shouldStop&&shouldStop())throw new Error('stale draw');
   const b=boxFor(city);
   // One query over a whole metro box is the request the mapping service
   // kills: its scan is too big and the reply never lands, which is why
@@ -765,7 +782,7 @@ async function fetchGeomRaw(city,cat){
   const perTile=await Promise.all(boxes.map(async q=>{
     const bbox=q[0]+','+q[1]+','+q[2]+','+q[3];
     const parts=OVERPASS_Q[cat.id].map(t=>'nwr'+t+'('+bbox+');').join('');
-    try{return await overpassQuery('[out:json][timeout:45];('+parts+');out center 900;',60000,S.current&&keyOf(S.current)===keyOf(city))}
+    try{return await overpassQuery('[out:json][timeout:45];('+parts+');out center 900;',60000,S.current&&keyOf(S.current)===keyOf(city),shouldStop)}
     catch(e){return null}
   }));
   const seen=new Set(),pts=[];
@@ -992,6 +1009,17 @@ async function drawHexes(){
   // leave it missing (see addHexLayers), and every draw self-heals it
   // instead of trusting that an earlier event re-added it
   ensureHexLayers();
+  // a draw is stale once the visitor has moved to another city or lens;
+  // its in-flight geometry queries then abandon the shared Overpass
+  // slots instead of starving the view actually on screen. Generation
+  // bumps within the same city and lens do NOT stale a fetch: the
+  // fetches are shared per city and category (see fetchGeom), and the
+  // generation guard below still decides what may paint.
+  const stale=()=>S.current!==city||S.hexCat!==catId;
+  // a failure note belongs to the view that produced it; a new view
+  // never inherits a previous category's UNAVAILABLE note
+  const hn0=$('hexnote');
+  if(hn0&&hn0.textContent.indexOf('Hex site data unavailable')===0)hn0.textContent='';
   // generation guard: overlapping draws (selectCity fires two, a lens change
   // a third) must not let an older draw's late geometry overwrite the grid
   // the panel reads, or the map and the panel end up describing different
@@ -1042,8 +1070,9 @@ async function drawHexes(){
     todoCats.forEach(c=>{city.geomState[c.id]='loading'});
     if(todoCats.length)paintOv();
     await Promise.allSettled(todoCats.map(async c=>{
-      try{city.geom[c.id]=await fetchGeom(city,c);city.geomState[c.id]='ok'}
+      try{city.geom[c.id]=await fetchGeom(city,c,stale);city.geomState[c.id]='ok'}
       catch(e){
+        if(stale())return;
         // a late failure must not stamp the category failed over
         // points already on hand (bundle or cache): the state
         // describes what the map can show, and it can show those
@@ -1209,11 +1238,17 @@ async function loadCityData(city){
   if(needCounts){
     try{city.counts=await fetchCounts(city)}catch(e){}
     commit();
-  }else if(city.liveCats.size<CATS.length&&!city._openRefreshed){
-    // the city already renders (snapshot or saved figures); opening it asks
-    // once for the latest live counts in the background, and they replace
-    // the dated figures in place if the services answer
-    city._openRefreshed=true;
+  }else if(city.liveCats.size<CATS.length&&Date.now()-(city._openRefreshT||0)>90000){
+    // the city already renders (snapshot or saved figures); opening it
+    // asks for the latest live counts in the background, and they
+    // replace the dated figures in place if the services answer. The
+    // gate is a timestamp, not a one-shot latch: a refresh that ran
+    // into a throttled minute at open used to spend the city's only
+    // attempt for the whole session, stranding the freshness line on
+    // LIVE REFRESH PENDING forever (Philadelphia, Nov 22). The healing
+    // chain re-enters here, so a failed attempt is retried at most
+    // once per 90 seconds per city.
+    city._openRefreshT=Date.now();
     refreshCounts(city).then(any=>{if(any)commit()}).catch(()=>{});
     // same courtesy for hex points that came from the shipped bundle:
     // one live fetch in the background replaces them if it lands
